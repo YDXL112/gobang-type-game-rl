@@ -3,7 +3,7 @@ from rl_mcts import Trainer
 
 def main():
     # 训练规模
-    batch_size = 32
+    batch_size = 8
     episodes = 100
     max_steps = 40
     device = None  # 'cuda' 或 'cpu'，None 自动选择
@@ -24,13 +24,13 @@ def main():
     block_kernel_size = 3
     channels = 64
     num_layers = 4
-    activation = "gelu"  # 或 'relu'
+    activation = "relu"  # 或 'relu'
     bias = True
     mcts_num_simulations = 256
     mcts_max_depth = 8
     c_puct = 1.5
-    rollout_per_leaf = 16
-    rollout_max_moves = 64
+    rollout_per_leaf = 32
+    rollout_max_moves = 40
 
     trainer = Trainer(
         batch_size=batch_size,
