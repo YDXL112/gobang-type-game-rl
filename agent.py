@@ -41,7 +41,7 @@ class Agent(nn.Module):
         legal = batch_tracker.legal_mask().to(self.device)
         feats = self.extract_feature(state, side_vec)
         logits = self.net(feats)
-        flat_logits = logits.flatten(2)
+        flat_logits = logits.flatten(1)
         mask = legal.view(legal.shape[0], -1)
         neg_inf = torch.finfo(flat_logits.dtype).min
         flat_logits = torch.where(mask, flat_logits, torch.full_like(flat_logits, neg_inf))
@@ -56,9 +56,9 @@ class Agent(nn.Module):
             else:
                 a = int(torch.argmax(counts).item())
             actions.append(a)
-            probs.append(pi[idx, a].item())
+            probs.append(pi[idx, a])
         actions = torch.tensor(actions, dtype=torch.int64, device=self.device)
-        probs = torch.tensor(probs, dtype=torch.float32, device=self.device)
+        probs = torch.stack(probs).to(self.device)
         return actions, probs
 
     def extract_feature(self, state, side):
@@ -243,8 +243,14 @@ class Agent(nn.Module):
                 idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
                 if idx.numel() > 0:
                     live3[idx, i, s + 1 : s + 4] = 1
-                left_block = (s == 0) | ((op[:, i, s - 1] == 1) | (~empty[:, i, s - 1]))
-                right_block = (s + 5 >= 8) | ((op[:, i, s + 5] == 1) | (~empty[:, i, s + 5]))
+                if s == 0:
+                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    left_block = (op[:, i, s - 1] == 1) | (~empty[:, i, s - 1])
+                if s + 5 >= 8:
+                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    right_block = (op[:, i, s + 5] == 1) | (~empty[:, i, s + 5])
                 cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
                           (empty[:, i, s + 3]) & left_block
                 idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
@@ -263,8 +269,14 @@ class Agent(nn.Module):
                 idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
                 if idx.numel() > 0:
                     live3[idx, s + 1 : s + 4, j] = 1
-                left_block = (s == 0) | ((op[:, s - 1, j] == 1) | (~empty[:, s - 1, j]))
-                right_block = (s + 5 >= 8) | ((op[:, s + 5, j] == 1) | (~empty[:, s + 5, j]))
+                if s == 0:
+                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    left_block = (op[:, s - 1, j] == 1) | (~empty[:, s - 1, j])
+                if s + 5 >= 8:
+                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    right_block = (op[:, s + 5, j] == 1) | (~empty[:, s + 5, j])
                 cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
                           (empty[:, s + 3, j]) & left_block
                 idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
@@ -289,7 +301,10 @@ class Agent(nn.Module):
                         ii, jj = cells[s + t]
                         live3[idx, ii, jj] = 1
                 lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
-                rb = (s + 5 >= L) | ((op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]]))
+                if s + 5 >= L:
+                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
                 cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
                 idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
                 if idx.numel() > 0:
@@ -310,7 +325,10 @@ class Agent(nn.Module):
                         ii, jj = cells[s + t]
                         live3[idx, ii, jj] = 1
                 lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
-                rb = (s + 5 >= L) | ((op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]]))
+                if s + 5 >= L:
+                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
                 cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
                 idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
                 if idx.numel() > 0:
@@ -396,101 +414,106 @@ class Agent(nn.Module):
         B = me.shape[0]
         empty = (me == 0) & (op == 0)
         cnt = torch.zeros_like(me)
-        def mark_line(seq, coords, length):
-            n = len(seq)
-            for i in range(n - length + 1):
-                yield i, seq[i : i + length], coords[i : i + length]
-        for b in range(B):
-            for i in range(8):
-                seq_me = me[b, i, :].cpu().numpy().tolist()
-                seq_op = op[b, i, :].cpu().numpy().tolist()
-                seq_empty = empty[b, i, :].cpu().numpy().tolist()
-                coords = [(i, j) for j in range(8)]
-                for k, window, wcoords in mark_line(seq_me, coords, 5):
-                    if window == [0, 1, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 4] == 1:
-                        for u in range(1, 4):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-                    left_block = 1 if k - 1 < 0 else (seq_op[k - 1] == 1 or (seq_empty[k - 1] == 0 and seq_me[k - 1] == 0))
-                    right_block = 1 if k + 5 > 8 else (seq_op[k + 5] == 1 or (seq_empty[k + 5] == 0 and seq_me[k + 5] == 0))
-                    if window[0:5] == [1, 1, 1, 0, 0] and seq_empty[k + 3] == 1 and left_block:
-                        for u in range(0, 3):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-                    if window[0:5] == [0, 1, 1, 1, 0] and (left_block ^ right_block):
-                        for u in range(1, 4):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-            for j in range(8):
-                seq_me = me[b, :, j].cpu().numpy().tolist()
-                seq_op = op[b, :, j].cpu().numpy().tolist()
-                seq_empty = empty[b, :, j].cpu().numpy().tolist()
-                coords = [(i, j) for i in range(8)]
-                for k, window, wcoords in mark_line(seq_me, coords, 5):
-                    if window == [0, 1, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 4] == 1:
-                        for u in range(1, 4):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-                    left_block = 1 if k - 1 < 0 else (seq_op[k - 1] == 1 or (seq_empty[k - 1] == 0 and seq_me[k - 1] == 0))
-                    right_block = 1 if k + 5 > 8 else (seq_op[k + 5] == 1 or (seq_empty[k + 5] == 0 and seq_me[k + 5] == 0))
-                    if window[0:5] == [1, 1, 1, 0, 0] and seq_empty[k + 3] == 1 and left_block:
-                        for u in range(0, 3):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-                    if window[0:5] == [0, 1, 1, 1, 0] and (left_block ^ right_block):
-                        for u in range(1, 4):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-            for d in range(-7, 8):
-                cells = []
-                for i in range(8):
-                    j = i + d
-                    if 0 <= j < 8:
-                        cells.append((i, j))
-                seq_me = [me[b, i, j].item() for i, j in cells]
-                seq_op = [op[b, i, j].item() for i, j in cells]
-                seq_empty = [empty[b, i, j].item() for i, j in cells]
-                for k in range(0, len(cells) - 4):
-                    window = seq_me[k : k + 5]
-                    if window == [0, 1, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 4] == 1:
-                        for u in range(1, 4):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-                    left_block = 1 if k - 1 < 0 else (seq_op[k - 1] == 1 or (seq_empty[k - 1] == 0 and seq_me[k - 1] == 0))
-                    right_block = 1 if k + 5 >= len(cells) else (seq_op[k + 5] == 1 or (seq_empty[k + 5] == 0 and seq_me[k + 5] == 0))
-                    if window[0:5] == [1, 1, 1, 0, 0] and k + 3 < len(cells) and seq_empty[k + 3] == 1 and left_block:
-                        for u in range(0, 3):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-                    if window[0:5] == [0, 1, 1, 1, 0] and (left_block ^ right_block):
-                        for u in range(1, 4):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-            for d in range(-7, 8):
-                cells = []
-                for i in range(8):
-                    j = -i + d
-                    if 0 <= j < 8:
-                        cells.append((i, j))
-                seq_me = [me[b, i, j].item() for i, j in cells]
-                seq_op = [op[b, i, j].item() for i, j in cells]
-                seq_empty = [empty[b, i, j].item() for i, j in cells]
-                for k in range(0, len(cells) - 4):
-                    window = seq_me[k : k + 5]
-                    if window == [0, 1, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 4] == 1:
-                        for u in range(1, 4):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-                    left_block = 1 if k - 1 < 0 else (seq_op[k - 1] == 1 or (seq_empty[k - 1] == 0 and seq_me[k - 1] == 0))
-                    right_block = 1 if k + 5 >= len(cells) else (seq_op[k + 5] == 1 or (seq_empty[k + 5] == 0 and seq_me[k + 5] == 0))
-                    if window[0:5] == [1, 1, 1, 0, 0] and k + 3 < len(cells) and seq_empty[k + 3] == 1 and left_block:
-                        for u in range(0, 3):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-                    if window[0:5] == [0, 1, 1, 1, 0] and (left_block ^ right_block):
-                        for u in range(1, 4):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
+        for i in range(8):
+            for s in range(8 - 4):
+                w = me[:, i, s : s + 5]
+                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
+                       (empty[:, i, s]) & (empty[:, i, s + 4])
+                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    cnt[idx, i, s + 1 : s + 4] += 1
+                if s == 0:
+                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    left_block = (op[:, i, s - 1] == 1) | (~empty[:, i, s - 1])
+                if s + 5 >= 8:
+                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    right_block = (op[:, i, s + 5] == 1) | (~empty[:, i, s + 5])
+                cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
+                          (empty[:, i, s + 3]) & left_block
+                idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    cnt[idx, i, s : s + 3] += 1
+                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
+                          (left_block ^ right_block)
+                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    cnt[idx, i, s + 1 : s + 4] += 1
+        for j in range(8):
+            for s in range(8 - 4):
+                w = me[:, s : s + 5, j]
+                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
+                       (empty[:, s, j]) & (empty[:, s + 4, j])
+                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    cnt[idx, s + 1 : s + 4, j] += 1
+                if s == 0:
+                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    left_block = (op[:, s - 1, j] == 1) | (~empty[:, s - 1, j])
+                if s + 5 >= 8:
+                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    right_block = (op[:, s + 5, j] == 1) | (~empty[:, s + 5, j])
+                cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
+                          (empty[:, s + 3, j]) & left_block
+                idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    cnt[idx, s : s + 3, j] += 1
+                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
+                          (left_block ^ right_block)
+                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    cnt[idx, s + 1 : s + 4, j] += 1
+        for d in range(-7, 8):
+            cells = [(i, i + d) for i in range(8) if 0 <= i + d < 8]
+            L = len(cells)
+            for s in range(0, L - 4):
+                w = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(5)], dim=1)
+                e0 = empty[:, cells[s][0], cells[s][1]]
+                e4 = empty[:, cells[s + 4][0], cells[s + 4][1]]
+                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & e0 & e4
+                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    for t in range(1, 4):
+                        ii, jj = cells[s + t]
+                        cnt[idx, ii, jj] += 1
+                lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
+                if s + 5 >= L:
+                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
+                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
+                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    for t in range(1, 4):
+                        ii, jj = cells[s + t]
+                        cnt[idx, ii, jj] += 1
+        for d in range(-7, 8):
+            cells = [(i, -i + d) for i in range(8) if 0 <= -i + d < 8]
+            L = len(cells)
+            for s in range(0, L - 4):
+                w = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(5)], dim=1)
+                e0 = empty[:, cells[s][0], cells[s][1]]
+                e4 = empty[:, cells[s + 4][0], cells[s + 4][1]]
+                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & e0 & e4
+                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    for t in range(1, 4):
+                        ii, jj = cells[s + t]
+                        cnt[idx, ii, jj] += 1
+                lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
+                if s + 5 >= L:
+                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
+                else:
+                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
+                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
+                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
+                if idx.numel() > 0:
+                    for t in range(1, 4):
+                        ii, jj = cells[s + t]
+                        cnt[idx, ii, jj] += 1
         return (cnt >= 2).float()
 
     def mcts_search(self, batch_tracker, side, idx, prior_pi):
@@ -512,22 +535,30 @@ class Agent(nn.Module):
             kd[:, :, 0, 0] = 1.0; kd[:, :, 1, 1] = 1.0; kd[:, :, 2, 2] = 1.0; kd[:, :, 3, 3] = 1.0
             ka[:, :, 0, 3] = 1.0; ka[:, :, 1, 2] = 1.0; ka[:, :, 2, 1] = 1.0; ka[:, :, 3, 0] = 1.0
             sh = F.conv2d(x, kh); sv = F.conv2d(x, kv); sd = F.conv2d(x, kd); sa = F.conv2d(x, ka)
-            p1 = (sh == 4.0) | (sv == 4.0) | (sd == 4.0) | (sa == 4.0)
-            p2 = (sh == -4.0) | (sv == -4.0) | (sd == -4.0) | (sa == -4.0)
-            if p1.flatten(1).any(): return 1
-            if p2.flatten(1).any(): return -1
+            p1_h = (sh == 4.0).flatten(1).any(1)
+            p1_v = (sv == 4.0).flatten(1).any(1)
+            p1_d = (sd == 4.0).flatten(1).any(1)
+            p1_a = (sa == 4.0).flatten(1).any(1)
+            win1 = p1_h | p1_v | p1_d | p1_a
+            p2_h = (sh == -4.0).flatten(1).any(1)
+            p2_v = (sv == -4.0).flatten(1).any(1)
+            p2_d = (sd == -4.0).flatten(1).any(1)
+            p2_a = (sa == -4.0).flatten(1).any(1)
+            win2 = p2_h | p2_v | p2_d | p2_a
+            if bool(win1.item()): return 1
+            if bool(win2.item()): return -1
             if (~(bd == 0.0)).view(-1).all(): return 0
             return 0
         class Node:
-            def __init__(self, bd, ply):
+            def __init__(self, bd, ply, device):
                 self.bd = bd
                 self.ply = ply
-                # 统计：访问次数N、累计价值W、均值Q、策略先验P
-                self.N = torch.zeros(64, dtype=torch.float32, device=self.device)
-                self.W = torch.zeros(64, dtype=torch.float32, device=self.device)
-                self.Q = torch.zeros(64, dtype=torch.float32, device=self.device)
+                self.device = device
+                self.N = torch.zeros(64, dtype=torch.float32, device=device)
+                self.W = torch.zeros(64, dtype=torch.float32, device=device)
+                self.Q = torch.zeros(64, dtype=torch.float32, device=device)
                 self.P = prior_pi.clone()
-        root = Node(board, turn)
+        root = Node(board, turn, self.device)
         root.P = prior_pi.clone()
         for _ in range(self.mcts_num_simulations):
             path = []
@@ -597,7 +628,7 @@ class Agent(nn.Module):
                     lmask = legal_moves(new_bd).unsqueeze(0)
                     neg_inf = torch.finfo(logits.dtype).min
                     logits = torch.where(lmask, logits, torch.full_like(logits, neg_inf))
-                    node = Node(new_bd, -cur_side)
+                    node = Node(new_bd, -cur_side, self.device)
                     node.P = torch.softmax(logits, dim=-1).squeeze(0)
                     cur_side = -cur_side
                     depth += 1

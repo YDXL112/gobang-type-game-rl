@@ -3,10 +3,10 @@ from rl_mcts import Trainer
 
 def main():
     # 训练规模
-    batch_size = 8
+    batch_size = 6
     episodes = 100
     max_steps = 40
-    device = None  # 'cuda' 或 'cpu'，None 自动选择
+    device = 'cuda'  # 'cuda' 或 'cpu'，None 自动选择
 
     # 优化与基线
     lr = 1e-3
@@ -22,15 +22,15 @@ def main():
     # Agent 网络与MCTS超参
     stem_kernel_size = 5
     block_kernel_size = 3
-    channels = 64
-    num_layers = 4
+    channels = 32
+    num_layers = 3
     activation = "relu"  # 或 'relu'
     bias = True
-    mcts_num_simulations = 256
-    mcts_max_depth = 8
+    mcts_num_simulations = 0
+    mcts_max_depth = 0
     c_puct = 1.5
-    rollout_per_leaf = 32
-    rollout_max_moves = 40
+    rollout_per_leaf = 0
+    rollout_max_moves = 0
 
     trainer = Trainer(
         batch_size=batch_size,

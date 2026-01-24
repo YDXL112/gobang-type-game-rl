@@ -63,6 +63,7 @@ class Trainer:
                 writer.writerow(["episode", "off_win_rate", "draw_rate", "def_win_rate", "loss"])
         episodes_out = []
         for ep in range(1, self.episodes + 1):
+            print(f"episode:{ep}")
             self.env.reset()
             logs_off = [[] for _ in range(self.batch_size)]
             logs_def = [[] for _ in range(self.batch_size)]
@@ -99,6 +100,7 @@ class Trainer:
                 else:
                     self.env.step(actions)
                 steps += 1
+                print(f"step:{steps}")
                 if self.env.all_done() or steps >= self.env.max_steps:
                     break
             winners = self.env.winners.to(self.device).float()
@@ -120,6 +122,17 @@ class Trainer:
                     loss = loss - adv_def * s_def
             self.optim.zero_grad()
             loss.backward()
+            total_abs = 0.0
+            total_cnt = 0
+            max_abs = 0.0
+            for p in self.agent.parameters():
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    total_abs += float(g.abs().sum().item())
+                    total_cnt += int(g.numel())
+                    max_abs = max(max_abs, float(g.abs().max().item()))
+            grad_mean_abs = (total_abs / total_cnt) if total_cnt > 0 else 0.0
+            print(f"[episode={ep}] steps={steps} loss={float(loss.item()):.6f} grad_mean_abs={grad_mean_abs:.6f} grad_max_abs={max_abs:.6f}")
             self.optim.step()
             off_rate = float((winners == 1).sum().item()) / float(self.batch_size)
             draw_rate = float((winners == 0).sum().item()) / float(self.batch_size)

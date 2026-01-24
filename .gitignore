@@ -3,4 +3,4 @@
 previous_version/
 results/
 saved_models/
-
+__pycache__/
