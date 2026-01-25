@@ -19,6 +19,7 @@ class Agent(nn.Module):
         c_puct: float = 1.5,
         rollout_per_leaf: int = 16,
         rollout_max_moves: int = 64,
+        use_policy_sampling: bool = False,
         device=None,
     ):
         super().__init__()
@@ -29,7 +30,7 @@ class Agent(nn.Module):
         self.mcts_max_depth = int(mcts_max_depth)
         self.c_puct = float(c_puct)
         self.rollout_per_leaf = int(rollout_per_leaf)
-        self.rollout_max_moves = int(rollout_max_moves)
+        self.use_policy_sampling = bool(use_policy_sampling)
 
     def forward(self, state, side, batch_tracker):
         # 前向：特征→logits→掩码→softmax；用MCTS基于根节点N选动作，返回动作及其策略概率
@@ -46,19 +47,22 @@ class Agent(nn.Module):
         neg_inf = torch.finfo(flat_logits.dtype).min
         flat_logits = torch.where(mask, flat_logits, torch.full_like(flat_logits, neg_inf))
         pi = torch.softmax(flat_logits, dim=-1)
-        actions = []
-        probs = []
-        for idx in range(state.shape[0]):
-            # 对每盘运行MCTS，根节点依据访问计数N选动作
-            counts = self.mcts_search(batch_tracker, int(side_vec[idx].item()), idx, pi[idx])
-            if counts.sum() == 0:
-                a = int(torch.argmax(pi[idx]).item())
-            else:
-                a = int(torch.argmax(counts).item())
-            actions.append(a)
-            probs.append(pi[idx, a])
-        actions = torch.tensor(actions, dtype=torch.int64, device=self.device)
-        probs = torch.stack(probs).to(self.device)
+        if self.use_policy_sampling or self.mcts_num_simulations <= 0:
+            actions = torch.multinomial(pi, 1).squeeze(1)
+            probs = pi[torch.arange(state.shape[0], device=self.device), actions]
+        else:
+            actions_list = []
+            probs_list = []
+            for idx in range(state.shape[0]):
+                counts = self.mcts_search(batch_tracker, int(side_vec[idx].item()), idx, pi[idx])
+                if counts.sum() == 0:
+                    a = int(torch.argmax(pi[idx]).item())
+                else:
+                    a = int(torch.argmax(counts).item())
+                actions_list.append(a)
+                probs_list.append(pi[idx, a])
+            actions = torch.tensor(actions_list, dtype=torch.int64, device=self.device)
+            probs = torch.stack(probs_list).to(self.device)
         return actions, probs
 
     def extract_feature(self, state, side):

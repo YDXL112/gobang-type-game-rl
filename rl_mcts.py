@@ -26,6 +26,7 @@ class Trainer:
         c_puct: float = 1.5,
         rollout_per_leaf: int = 16,
         rollout_max_moves: int = 64,
+        use_policy_sampling: bool = False,
     ):
         self.batch_size = int(batch_size)
         self.lr = float(lr)
@@ -44,6 +45,7 @@ class Trainer:
             c_puct=c_puct,
             rollout_per_leaf=rollout_per_leaf,
             rollout_max_moves=rollout_max_moves,
+            use_policy_sampling=use_policy_sampling,
             device=self.device,
         )
         self.optim = torch.optim.Adam(self.agent.parameters(), lr=self.lr)

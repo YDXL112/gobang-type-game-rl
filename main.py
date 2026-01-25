@@ -15,9 +15,9 @@ def main():
     # 模型与结果保存
     model_dir = "saved_models"
     results_dir = "results"
-    model_name = "run1.pth"
-    csv_name = "run1.csv"
-    json_name = "run1.json"
+    model_name = "run2.pth"
+    csv_name = "run2.csv"
+    json_name = "run2.json"
 
     # Agent 网络与MCTS超参
     stem_kernel_size = 5
@@ -31,6 +31,7 @@ def main():
     c_puct = 1.5
     rollout_per_leaf = 0
     rollout_max_moves = 0
+    sample_policy = True  # True 时按策略采样动作，关闭MCTS
 
     trainer = Trainer(
         batch_size=batch_size,
@@ -50,6 +51,7 @@ def main():
         c_puct=c_puct,
         rollout_per_leaf=rollout_per_leaf,
         rollout_max_moves=rollout_max_moves,
+        use_policy_sampling=sample_policy,
     )
     trainer.train(
         model_dir=model_dir,
