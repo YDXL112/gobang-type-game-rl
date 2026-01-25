@@ -1,13 +1,13 @@
 import os
 # 设置可用的显卡编号
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 from rl_mcts import Trainer
 
 
 def main():
     # 训练规模
     batch_size = 2048
-    episodes = 10000
+    episodes = 1000
     max_steps = 40
     device = 'cuda'  # 'cuda' 或 'cpu'，None 自动选择
 
@@ -18,9 +18,9 @@ def main():
     # 模型与结果保存
     model_dir = "saved_models"
     results_dir = "results"
-    model_name = "run2.pth"
-    csv_name = "run2.csv"
-    json_name = "run2.json"
+    model_name = "run4.pth"
+    csv_name = "run4.csv"
+    json_name = "run4.json"
 
     # Agent 网络与MCTS超参
     stem_kernel_size = 5
@@ -29,15 +29,15 @@ def main():
     num_layers = 5
     activation = "relu"  # 或 'relu'
     bias = True
-    mcts_num_simulations = 0
-    mcts_max_depth = 0
+    mcts_num_simulations = 128
+    mcts_max_depth = 3
     c_puct = 1.5
-    rollout_per_leaf = 0
-    rollout_max_moves = 0
-    sample_policy = True  # True 时按策略采样动作，关闭MCTS
+    rollout_per_leaf = 16
+    rollout_max_moves = 40
+    sample_policy = False  # True 时按策略采样动作，关闭MCTS
     half_self_play = True  # True 时半监督：前半批训练先手，后半批训练后手
     force_win_move = True  # True 时优先选择一步致胜动作
-    eval_interval_episodes = 20  # 每隔多少集进行一次新旧模型评测
+    eval_interval_episodes = 10  # 每隔多少集进行一次新旧模型评测
     eval_games = 512  # 评测对弈局数
     replace_threshold = 0.55  # 新模型胜率至少达到该阈值才替换旧模型
 
