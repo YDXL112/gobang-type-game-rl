@@ -92,433 +92,330 @@ class Agent(nn.Module):
         return x
 
     def _connectivity_channels(self, mask, Ns):
-        # 四方向连续段长度恰为N的格置1（水平/垂直/主对角/反对角）
         B = mask.shape[0]
+        device = mask.device
         out = []
+        x = mask.unsqueeze(1)  # [B,1,8,8]
         for N in Ns:
-            m = torch.zeros_like(mask)
-            for i in range(8):
-                row = mask[:, i, :]
-                for b in range(B):
-                    r = row[b]
-                    start = 0
-                    while start < 8:
-                        if r[start] == 1:
-                            end = start
-                            while end + 1 < 8 and r[end + 1] == 1:
-                                end += 1
-                            if end - start + 1 == N:
-                                m[b, i, start : end + 1] = 1
-                            start = end + 1
-                        else:
-                            start += 1
-            for j in range(8):
-                col = mask[:, :, j]
-                for b in range(B):
-                    c = col[b]
-                    start = 0
-                    while start < 8:
-                        if c[start] == 1:
-                            end = start
-                            while end + 1 < 8 and c[end + 1] == 1:
-                                end += 1
-                            if end - start + 1 == N:
-                                m[b, start : end + 1, j] = 1
-                            start = end + 1
-                        else:
-                            start += 1
-            for d in range(-7, 8):
-                for b in range(B):
-                    cells = []
-                    for i in range(8):
-                        j = i + d
-                        if 0 <= j < 8:
-                            cells.append((i, j))
-                    k = 0
-                    while k < len(cells):
-                        i, j = cells[k]
-                        if mask[b, i, j] == 1:
-                            t = k
-                            while t + 1 < len(cells) and mask[b, cells[t + 1][0], cells[t + 1][1]] == 1:
-                                t += 1
-                            if t - k + 1 == N:
-                                for u in range(k, t + 1):
-                                    ii, jj = cells[u]
-                                    m[b, ii, jj] = 1
-                            k = t + 1
-                        else:
-                            k += 1
-            for d in range(-7, 8):
-                for b in range(B):
-                    cells = []
-                    for i in range(8):
-                        j = -i + d
-                        if 0 <= j < 8:
-                            cells.append((i, j))
-                    k = 0
-                    while k < len(cells):
-                        i, j = cells[k]
-                        if mask[b, i, j] == 1:
-                            t = k
-                            while t + 1 < len(cells) and mask[b, cells[t + 1][0], cells[t + 1][1]] == 1:
-                                t += 1
-                            if t - k + 1 == N:
-                                for u in range(k, t + 1):
-                                    ii, jj = cells[u]
-                                    m[b, ii, jj] = 1
-                            k = t + 1
-                        else:
-                            k += 1
+            seg = torch.zeros_like(mask)
+            # 水平
+            kH = torch.ones((1, 1, 1, N), device=device)
+            sumH = F.conv2d(x, kH)  # [B,1,8,8-N+1]
+            hitsH = (sumH.squeeze(1) == float(N))
+            padH = F.pad(mask, (1, 1, 0, 0))  # pad cols
+            cols = torch.arange(0, 8 - N + 1, device=device)
+            leftH = padH[:, :, cols]
+            rightH = padH[:, :, cols + N + 1]
+            hitsH = hitsH & (leftH == 0) & (rightH == 0)
+            for t in range(N):
+                seg[:, :, cols + t] = torch.where(hitsH, torch.ones_like(seg[:, :, cols + t]), seg[:, :, cols + t])
+            # 垂直
+            kV = torch.ones((1, 1, N, 1), device=device)
+            sumV = F.conv2d(x, kV)  # [B,1,8-N+1,8]
+            hitsV = (sumV.squeeze(1) == float(N))
+            padV = F.pad(mask, (0, 0, 1, 1))  # pad rows
+            rows = torch.arange(0, 8 - N + 1, device=device)
+            topV = padV[:, rows, :]
+            botV = padV[:, rows + N + 1, :]
+            hitsV = hitsV & (topV == 0) & (botV == 0)
+            for t in range(N):
+                seg[:, rows + t, :] = torch.where(hitsV, torch.ones_like(seg[:, rows + t, :]), seg[:, rows + t, :])
+            # 主对角线
+            kD = torch.zeros((1, 1, N, N), device=device)
+            for t in range(N):
+                kD[0, 0, t, t] = 1.0
+            sumD = F.conv2d(x, kD)  # [B,1,8-N+1,8-N+1]
+            hitsD = (sumD.squeeze(1) == float(N))
+            mp = F.pad(mask, (1, 1, 1, 1))  # [B,10,10]
+            leftD = mp[:, 0 : 8 - N + 1, 0 : 8 - N + 1]
+            rightD = mp[:, (N + 1) : (N + 1) + (8 - N + 1), (N + 1) : (N + 1) + (8 - N + 1)]
+            hitsD = hitsD & (leftD == 0) & (rightD == 0)
+            for t in range(N):
+                seg[:, t : t + (8 - N + 1), t : t + (8 - N + 1)] = torch.where(
+                    hitsD, torch.ones_like(seg[:, t : t + (8 - N + 1), t : t + (8 - N + 1)]), seg[:, t : t + (8 - N + 1), t : t + (8 - N + 1)]
+                )
+            # 反对角线（通过翻列处理为主对角）
+            mf = torch.flip(mask, dims=[2])
+            xf = mf.unsqueeze(1)
+            sumAf = F.conv2d(xf, kD)  # 主对角于翻转
+            hitsAf = (sumAf.squeeze(1) == float(N))
+            mpf = F.pad(mf, (1, 1, 1, 1))
+            leftAf = mpf[:, 0 : 8 - N + 1, 0 : 8 - N + 1]
+            rightAf = mpf[:, (N + 1) : (N + 1) + (8 - N + 1), (N + 1) : (N + 1) + (8 - N + 1)]
+            hitsAf = hitsAf & (leftAf == 0) & (rightAf == 0)
+            segAf = torch.zeros_like(mf)
+            for t in range(N):
+                segAf[:, t : t + (8 - N + 1), t : t + (8 - N + 1)] = torch.where(
+                    hitsAf,
+                    torch.ones_like(segAf[:, t : t + (8 - N + 1), t : t + (8 - N + 1)]),
+                    segAf[:, t : t + (8 - N + 1), t : t + (8 - N + 1)],
+                )
+            segA = torch.flip(segAf, dims=[2])
+            m = torch.where((seg + segA) > 0, torch.ones_like(mask), torch.zeros_like(mask))
             out.append(m)
         return out
 
     def _live_rush(self, me, op):
         B = me.shape[0]
+        device = me.device
+        empty = ((me == 0) & (op == 0)).float()
+        x_me = me.unsqueeze(1)
+        x_empty = empty.unsqueeze(1)
         live2 = torch.zeros_like(me)
         live3 = torch.zeros_like(me)
         rush3 = torch.zeros_like(me)
-        empty = (me == 0) & (op == 0)
-        for i in range(8):
-            for s in range(8 - 3):
-                w = me[:, i, s : s + 4]
-                cond1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 0) & (w[:, 3] == 0) & (empty[:, i, s + 2]) & (empty[:, i, s + 3])
-                idx = torch.nonzero(cond1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    live2[idx, i, s : s + 2] = 1
-                cond2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (empty[:, i, s]) & (empty[:, i, s + 3])
-                idx = torch.nonzero(cond2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    live2[idx, i, s + 1 : s + 3] = 1
-        for j in range(8):
-            for s in range(8 - 3):
-                w = me[:, s : s + 4, j]
-                cond1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 0) & (w[:, 3] == 0) & (empty[:, s + 2, j]) & (empty[:, s + 3, j])
-                idx = torch.nonzero(cond1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    live2[idx, s : s + 2, j] = 1
-                cond2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (empty[:, s, j]) & (empty[:, s + 3, j])
-                idx = torch.nonzero(cond2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    live2[idx, s + 1 : s + 3, j] = 1
-        for d in range(-7, 8):
-            cells = [(i, i + d) for i in range(8) if 0 <= i + d < 8]
-            L = len(cells)
-            for s in range(0, L - 3):
-                i0, j0 = cells[s]
-                w0 = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(4)], dim=1)
-                cond1 = (w0[:, 0] == 1) & (w0[:, 1] == 1) & (w0[:, 2] == 0) & (w0[:, 3] == 0) & \
-                        (empty[:, cells[s + 2][0], cells[s + 2][1]]) & (empty[:, cells[s + 3][0], cells[s + 3][1]])
-                idx = torch.nonzero(cond1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(2):
-                        ii, jj = cells[s + t]
-                        live2[idx, ii, jj] = 1
-                cond2 = (w0[:, 0] == 0) & (w0[:, 1] == 1) & (w0[:, 2] == 1) & (w0[:, 3] == 0) & \
-                        (empty[:, cells[s][0], cells[s][1]]) & (empty[:, cells[s + 3][0], cells[s + 3][1]])
-                idx = torch.nonzero(cond2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 3):
-                        ii, jj = cells[s + t]
-                        live2[idx, ii, jj] = 1
-        for d in range(-7, 8):
-            cells = [(i, -i + d) for i in range(8) if 0 <= -i + d < 8]
-            L = len(cells)
-            for s in range(0, L - 3):
-                w0 = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(4)], dim=1)
-                cond1 = (w0[:, 0] == 1) & (w0[:, 1] == 1) & (w0[:, 2] == 0) & (w0[:, 3] == 0) & \
-                        (empty[:, cells[s + 2][0], cells[s + 2][1]]) & (empty[:, cells[s + 3][0], cells[s + 3][1]])
-                idx = torch.nonzero(cond1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(2):
-                        ii, jj = cells[s + t]
-                        live2[idx, ii, jj] = 1
-                cond2 = (w0[:, 0] == 0) & (w0[:, 1] == 1) & (w0[:, 2] == 1) & (w0[:, 3] == 0) & \
-                        (empty[:, cells[s][0], cells[s][1]]) & (empty[:, cells[s + 3][0], cells[s + 3][1]])
-                idx = torch.nonzero(cond2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 3):
-                        ii, jj = cells[s + t]
-                        live2[idx, ii, jj] = 1
-        for i in range(8):
-            for s in range(8 - 4):
-                w = me[:, i, s : s + 5]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                       (empty[:, i, s]) & (empty[:, i, s + 4])
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    live3[idx, i, s + 1 : s + 4] = 1
-                if s == 0:
-                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    left_block = (op[:, i, s - 1] == 1) | (~empty[:, i, s - 1])
-                if s + 5 >= 8:
-                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    right_block = (op[:, i, s + 5] == 1) | (~empty[:, i, s + 5])
-                cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
-                          (empty[:, i, s + 3]) & left_block
-                idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    rush3[idx, i, s : s + 3] = 1
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                          (left_block ^ right_block)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    rush3[idx, i, s + 1 : s + 4] = 1
-        for j in range(8):
-            for s in range(8 - 4):
-                w = me[:, s : s + 5, j]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                       (empty[:, s, j]) & (empty[:, s + 4, j])
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    live3[idx, s + 1 : s + 4, j] = 1
-                if s == 0:
-                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    left_block = (op[:, s - 1, j] == 1) | (~empty[:, s - 1, j])
-                if s + 5 >= 8:
-                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    right_block = (op[:, s + 5, j] == 1) | (~empty[:, s + 5, j])
-                cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
-                          (empty[:, s + 3, j]) & left_block
-                idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    rush3[idx, s : s + 3, j] = 1
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                          (left_block ^ right_block)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    rush3[idx, s + 1 : s + 4, j] = 1
-        for d in range(-7, 8):
-            cells = [(i, i + d) for i in range(8) if 0 <= i + d < 8]
-            L = len(cells)
-            for s in range(0, L - 4):
-                w = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(5)], dim=1)
-                e0 = empty[:, cells[s][0], cells[s][1]]
-                e4 = empty[:, cells[s + 4][0], cells[s + 4][1]]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & e0 & e4
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        live3[idx, ii, jj] = 1
-                lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
-                if s + 5 >= L:
-                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        rush3[idx, ii, jj] = 1
-        for d in range(-7, 8):
-            cells = [(i, -i + d) for i in range(8) if 0 <= -i + d < 8]
-            L = len(cells)
-            for s in range(0, L - 4):
-                w = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(5)], dim=1)
-                e0 = empty[:, cells[s][0], cells[s][1]]
-                e4 = empty[:, cells[s + 4][0], cells[s + 4][1]]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & e0 & e4
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        live3[idx, ii, jj] = 1
-                lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
-                if s + 5 >= L:
-                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        rush3[idx, ii, jj] = 1
+        # horizontal live2
+        k01 = torch.tensor([[[[1, 1, 0, 0]]]], dtype=torch.float32, device=device)
+        k23 = torch.tensor([[[[0, 0, 1, 1]]]], dtype=torch.float32, device=device)
+        s01 = F.conv2d(x_me, (k01 > 0).float())
+        s23_me = F.conv2d(x_me, (k23 > 0).float())
+        s23_empty = F.conv2d(x_empty, (k23 > 0).float())
+        hits_h_1100 = (s01.squeeze(1) == 2) & (s23_me.squeeze(1) == 0) & (s23_empty.squeeze(1) == 2)
+        kexp_0110 = torch.tensor([[[[1, 1, 0, 0]]]], dtype=torch.float32, device=device)
+        seg_h_1100 = F.conv_transpose2d(hits_h_1100.unsqueeze(1).float(), kexp_0110, stride=1)
+        k12 = torch.tensor([[[[0, 1, 1, 0]]]], dtype=torch.float32, device=device)
+        k03 = torch.tensor([[[[1, 0, 0, 1]]]], dtype=torch.float32, device=device)
+        s12 = F.conv2d(x_me, (k12 > 0).float())
+        s03_me = F.conv2d(x_me, (k03 > 0).float())
+        s03_empty = F.conv2d(x_empty, (k03 > 0).float())
+        hits_h_0110 = (s12.squeeze(1) == 2) & (s03_me.squeeze(1) == 0) & (s03_empty.squeeze(1) == 2)
+        kexp_0110_mid = torch.tensor([[[[0, 1, 1, 0]]]], dtype=torch.float32, device=device)
+        seg_h_0110 = F.conv_transpose2d(hits_h_0110.unsqueeze(1).float(), kexp_0110_mid, stride=1)
+        live2 = torch.where((seg_h_1100.squeeze(1) + seg_h_0110.squeeze(1)) > 0, torch.ones_like(live2), live2)
+        # vertical live2
+        k01_v = torch.tensor([[[[1], [1], [0], [0]]]], dtype=torch.float32, device=device)
+        k23_v = torch.tensor([[[[0], [0], [1], [1]]]], dtype=torch.float32, device=device)
+        s01_v = F.conv2d(x_me, (k01_v > 0).float())
+        s23_me_v = F.conv2d(x_me, (k23_v > 0).float())
+        s23_empty_v = F.conv2d(x_empty, (k23_v > 0).float())
+        hits_v_1100 = (s01_v.squeeze(1) == 2) & (s23_me_v.squeeze(1) == 0) & (s23_empty_v.squeeze(1) == 2)
+        kexp_v_0110 = k01_v
+        seg_v_1100 = F.conv_transpose2d(hits_v_1100.unsqueeze(1).float(), kexp_v_0110, stride=1)
+        k12_v = torch.tensor([[[[0], [1], [1], [0]]]], dtype=torch.float32, device=device)
+        k03_v = torch.tensor([[[[1], [0], [0], [1]]]], dtype=torch.float32, device=device)
+        s12_v = F.conv2d(x_me, (k12_v > 0).float())
+        s03_me_v = F.conv2d(x_me, (k03_v > 0).float())
+        s03_empty_v = F.conv2d(x_empty, (k03_v > 0).float())
+        hits_v_0110 = (s12_v.squeeze(1) == 2) & (s03_me_v.squeeze(1) == 0) & (s03_empty_v.squeeze(1) == 2)
+        seg_v_0110 = F.conv_transpose2d(hits_v_0110.unsqueeze(1).float(), k12_v, stride=1)
+        live2 = torch.where((live2 + seg_v_1100.squeeze(1) + seg_v_0110.squeeze(1)) > 0, torch.ones_like(live2), live2)
+        # diagonal live2
+        kd4 = torch.zeros((1, 1, 4, 4), device=device); kd4[0, 0, 0, 0] = 1; kd4[0, 0, 1, 1] = 1; kd4[0, 0, 2, 2] = 0; kd4[0, 0, 3, 3] = 0
+        kd4b = torch.zeros((1, 1, 4, 4), device=device); kd4b[0, 0, 0, 0] = 0; kd4b[0, 0, 1, 1] = 1; kd4b[0, 0, 2, 2] = 1; kd4b[0, 0, 3, 3] = 0
+        s_d_me_0110 = F.conv2d(x_me, (kd4b > 0).float())
+        s_d_me_1100 = F.conv2d(x_me, (kd4 > 0).float())
+        kd4_tail = torch.zeros((1, 1, 4, 4), device=device); kd4_tail[0, 0, 2, 2] = 1; kd4_tail[0, 0, 3, 3] = 1
+        kd4_head_tail = torch.zeros((1, 1, 4, 4), device=device); kd4_head_tail[0, 0, 0, 0] = 1; kd4_head_tail[0, 0, 3, 3] = 1
+        s_d_empty_tail = F.conv2d(x_empty, (kd4_tail > 0).float())
+        s_d_empty_head_tail = F.conv2d(x_empty, (kd4_head_tail > 0).float())
+        hits_d_1100 = (s_d_me_1100.squeeze(1) == 2) & (s_d_empty_tail.squeeze(1) == 2)
+        hits_d_0110 = (s_d_me_0110.squeeze(1) == 2) & (s_d_empty_head_tail.squeeze(1) == 2)
+        seg_d_1100 = F.conv_transpose2d(hits_d_1100.unsqueeze(1).float(), kd4, stride=1).squeeze(1)
+        seg_d_0110 = F.conv_transpose2d(hits_d_0110.unsqueeze(1).float(), kd4b, stride=1).squeeze(1)
+        live2 = torch.where((live2 + seg_d_1100 + seg_d_0110) > 0, torch.ones_like(live2), live2)
+        mf = torch.flip(me, dims=[2]); xf_me = mf.unsqueeze(1); empty_f = torch.flip(empty, dims=[2]); xf_empty = empty_f.unsqueeze(1)
+        s_ad_me_0110 = F.conv2d(xf_me, (kd4b > 0).float())
+        s_ad_me_1100 = F.conv2d(xf_me, (kd4 > 0).float())
+        s_ad_empty_tail = F.conv2d(xf_empty, (kd4_tail > 0).float())
+        s_ad_empty_head_tail = F.conv2d(xf_empty, (kd4_head_tail > 0).float())
+        hits_ad_1100 = (s_ad_me_1100.squeeze(1) == 2) & (s_ad_empty_tail.squeeze(1) == 2)
+        hits_ad_0110 = (s_ad_me_0110.squeeze(1) == 2) & (s_ad_empty_head_tail.squeeze(1) == 2)
+        seg_ad_1100 = torch.flip(F.conv_transpose2d(hits_ad_1100.unsqueeze(1).float(), kd4, stride=1).squeeze(1), dims=[2])
+        seg_ad_0110 = torch.flip(F.conv_transpose2d(hits_ad_0110.unsqueeze(1).float(), kd4b, stride=1).squeeze(1), dims=[2])
+        live2 = torch.where((live2 + seg_ad_1100 + seg_ad_0110) > 0, torch.ones_like(live2), live2)
+        # live3 and rush3 horizontal
+        k01340 = torch.tensor([[[[0, 1, 1, 1, 0]]]], dtype=torch.float32, device=device)
+        s01340_me = F.conv2d(x_me, (k01340 > 0).float())
+        s01_empty = F.conv2d(x_empty, torch.tensor([[[[1, 0, 0, 0, 0]]]] , dtype=torch.float32, device=device))
+        s40_empty = F.conv2d(x_empty, torch.tensor([[[[0, 0, 0, 0, 1]]]] , dtype=torch.float32, device=device))
+        hits_h_live3 = (s01340_me.squeeze(1) == 3) & (s01_empty.squeeze(1) == 1) & (s40_empty.squeeze(1) == 1)
+        kexp_h_live3 = torch.tensor([[[[0, 1, 1, 1, 0]]]], dtype=torch.float32, device=device)
+        seg_h_live3 = F.conv_transpose2d(hits_h_live3.unsqueeze(1).float(), kexp_h_live3, stride=1).squeeze(1)
+        left_block_h = torch.ones_like(hits_h_live3, dtype=torch.bool)
+        right_block_h = left_block_h
+        hits_h_rush3a = (F.conv2d(x_me, torch.tensor([[[[1, 1, 1, 0, 0]]]], dtype=torch.float32, device=device)).squeeze(1) == 3) & (F.conv2d(x_empty, torch.tensor([[[[0, 0, 0, 1, 0]]]], dtype=torch.float32, device=device)).squeeze(1) == 1) & left_block_h
+        seg_h_rush3a = F.conv_transpose2d(hits_h_rush3a.unsqueeze(1).float(), torch.tensor([[[[1, 1, 1, 0, 0]]]], dtype=torch.float32, device=device), stride=1).squeeze(1)
+        hits_h_rush3b = hits_h_live3 & (left_block_h ^ right_block_h)
+        seg_h_rush3b = seg_h_live3
+        rush3 = torch.where((seg_h_rush3a + seg_h_rush3b) > 0, torch.ones_like(rush3), rush3)
+        live3 = torch.where((seg_h_live3) > 0, torch.ones_like(live3), live3)
         return live2, live3, rush3
 
     def _double_two(self, me, op):
-        B = me.shape[0]
-        empty = (me == 0) & (op == 0)
-        cnt = torch.zeros_like(me)
-        def mark_line(seq, coords, length):
-            n = len(seq)
-            for i in range(n - length + 1):
-                yield i, seq[i : i + length], coords[i : i + length]
-        for b in range(B):
-            for i in range(8):
-                seq_me = me[b, i, :].cpu().numpy().tolist()
-                seq_empty = empty[b, i, :].cpu().numpy().tolist()
-                coords = [(i, j) for j in range(8)]
-                for k, window, wcoords in mark_line(seq_me, coords, 4):
-                    if window == [1, 1, 0, 0] and seq_empty[k + 2] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(0, 2):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-                    if window == [0, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(1, 3):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-            for j in range(8):
-                seq_me = me[b, :, j].cpu().numpy().tolist()
-                seq_empty = empty[b, :, j].cpu().numpy().tolist()
-                coords = [(i, j) for i in range(8)]
-                for k, window, wcoords in mark_line(seq_me, coords, 4):
-                    if window == [1, 1, 0, 0] and seq_empty[k + 2] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(0, 2):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-                    if window == [0, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(1, 3):
-                            ii, jj = wcoords[u]
-                            cnt[b, ii, jj] += 1
-            for d in range(-7, 8):
-                cells = []
-                for i in range(8):
-                    j = i + d
-                    if 0 <= j < 8:
-                        cells.append((i, j))
-                seq_me = [me[b, i, j].item() for i, j in cells]
-                seq_empty = [empty[b, i, j].item() for i, j in cells]
-                for k in range(0, len(cells) - 3):
-                    window = seq_me[k : k + 4]
-                    if window == [1, 1, 0, 0] and k + 3 < len(cells) and seq_empty[k + 2] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(0, 2):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-                    if window == [0, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(1, 3):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-            for d in range(-7, 8):
-                cells = []
-                for i in range(8):
-                    j = -i + d
-                    if 0 <= j < 8:
-                        cells.append((i, j))
-                seq_me = [me[b, i, j].item() for i, j in cells]
-                seq_empty = [empty[b, i, j].item() for i, j in cells]
-                for k in range(0, len(cells) - 3):
-                    window = seq_me[k : k + 4]
-                    if window == [1, 1, 0, 0] and k + 3 < len(cells) and seq_empty[k + 2] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(0, 2):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-                    if window == [0, 1, 1, 0] and seq_empty[k] == 1 and seq_empty[k + 3] == 1:
-                        for u in range(1, 3):
-                            ii, jj = cells[k + u]
-                            cnt[b, ii, jj] += 1
-        return (cnt >= 2).float()
+        device = me.device
+        empty = ((me == 0) & (op == 0)).float()
+        x_me = me.unsqueeze(1)
+        x_empty = empty.unsqueeze(1)
+        k01 = torch.tensor([[[[1, 1, 0, 0]]]], dtype=torch.float32, device=device)
+        k12 = torch.tensor([[[[0, 1, 1, 0]]]], dtype=torch.float32, device=device)
+        k23 = torch.tensor([[[[0, 0, 1, 1]]]], dtype=torch.float32, device=device)
+        k03 = torch.tensor([[[[1, 0, 0, 1]]]], dtype=torch.float32, device=device)
+        s01 = F.conv2d(x_me, (k01 > 0).float())
+        s23_me = F.conv2d(x_me, (k23 > 0).float())
+        s23_empty = F.conv2d(x_empty, (k23 > 0).float())
+        hits_h_1100 = (s01.squeeze(1) == 2) & (s23_me.squeeze(1) == 0) & (s23_empty.squeeze(1) == 2)
+        seg_h_1100 = F.conv_transpose2d(hits_h_1100.unsqueeze(1).float(), k01, stride=1).squeeze(1)
+        s12 = F.conv2d(x_me, (k12 > 0).float())
+        s03_me = F.conv2d(x_me, (k03 > 0).float())
+        s03_empty = F.conv2d(x_empty, (k03 > 0).float())
+        hits_h_0110 = (s12.squeeze(1) == 2) & (s03_me.squeeze(1) == 0) & (s03_empty.squeeze(1) == 2)
+        seg_h_0110 = F.conv_transpose2d(hits_h_0110.unsqueeze(1).float(), k12, stride=1).squeeze(1)
+        # vertical
+        k01_v = torch.tensor([[[[1], [1], [0], [0]]]], dtype=torch.float32, device=device)
+        k12_v = torch.tensor([[[[0], [1], [1], [0]]]], dtype=torch.float32, device=device)
+        k23_v = torch.tensor([[[[0], [0], [1], [1]]]], dtype=torch.float32, device=device)
+        k03_v = torch.tensor([[[[1], [0], [0], [1]]]], dtype=torch.float32, device=device)
+        s01_v = F.conv2d(x_me, (k01_v > 0).float())
+        s23_me_v = F.conv2d(x_me, (k23_v > 0).float())
+        s23_empty_v = F.conv2d(x_empty, (k23_v > 0).float())
+        hits_v_1100 = (s01_v.squeeze(1) == 2) & (s23_me_v.squeeze(1) == 0) & (s23_empty_v.squeeze(1) == 2)
+        seg_v_1100 = F.conv_transpose2d(hits_v_1100.unsqueeze(1).float(), k01_v, stride=1).squeeze(1)
+        s12_v = F.conv2d(x_me, (k12_v > 0).float())
+        s03_me_v = F.conv2d(x_me, (k03_v > 0).float())
+        s03_empty_v = F.conv2d(x_empty, (k03_v > 0).float())
+        hits_v_0110 = (s12_v.squeeze(1) == 2) & (s03_me_v.squeeze(1) == 0) & (s03_empty_v.squeeze(1) == 2)
+        seg_v_0110 = F.conv_transpose2d(hits_v_0110.unsqueeze(1).float(), k12_v, stride=1).squeeze(1)
+        # diagonals
+        kd4 = torch.zeros((1, 1, 4, 4), device=device); kd4[0, 0, 0, 0] = 1; kd4[0, 0, 1, 1] = 1
+        kd4b = torch.zeros((1, 1, 4, 4), device=device); kd4b[0, 0, 1, 1] = 1; kd4b[0, 0, 2, 2] = 1
+        tail = torch.zeros((1, 1, 4, 4), device=device); tail[0, 0, 2, 2] = 1; tail[0, 0, 3, 3] = 1
+        headtail = torch.zeros((1, 1, 4, 4), device=device); headtail[0, 0, 0, 0] = 1; headtail[0, 0, 3, 3] = 1
+        s_d_1100 = F.conv2d(x_me, (kd4 > 0).float()).squeeze(1)
+        s_d_tail_me = F.conv2d(x_me, (tail > 0).float()).squeeze(1)
+        s_d_tail_empty = F.conv2d(x_empty, (tail > 0).float()).squeeze(1)
+        hits_d_1100 = (s_d_1100 == 2) & (s_d_tail_me == 0) & (s_d_tail_empty == 2)
+        seg_d_1100 = F.conv_transpose2d(hits_d_1100.unsqueeze(1).float(), kd4, stride=1).squeeze(1)
+        s_d_0110 = F.conv2d(x_me, (kd4b > 0).float()).squeeze(1)
+        s_d_headtail_me = F.conv2d(x_me, (headtail > 0).float()).squeeze(1)
+        s_d_headtail_empty = F.conv2d(x_empty, (headtail > 0).float()).squeeze(1)
+        hits_d_0110 = (s_d_0110 == 2) & (s_d_headtail_me == 0) & (s_d_headtail_empty == 2)
+        seg_d_0110 = F.conv_transpose2d(hits_d_0110.unsqueeze(1).float(), kd4b, stride=1).squeeze(1)
+        mf = torch.flip(me, dims=[2]).unsqueeze(1)
+        ef = torch.flip(empty, dims=[2]).unsqueeze(1)
+        s_ad_1100 = F.conv2d(mf, (kd4 > 0).float()).squeeze(1)
+        s_ad_tail_me = F.conv2d(mf, (tail > 0).float()).squeeze(1)
+        s_ad_tail_empty = F.conv2d(ef, (tail > 0).float()).squeeze(1)
+        hits_ad_1100 = (s_ad_1100 == 2) & (s_ad_tail_me == 0) & (s_ad_tail_empty == 2)
+        seg_ad_1100 = torch.flip(F.conv_transpose2d(hits_ad_1100.unsqueeze(1).float(), kd4, stride=1).squeeze(1), dims=[2])
+        s_ad_0110 = F.conv2d(mf, (kd4b > 0).float()).squeeze(1)
+        s_ad_headtail_me = F.conv2d(mf, (headtail > 0).float()).squeeze(1)
+        s_ad_headtail_empty = F.conv2d(ef, (headtail > 0).float()).squeeze(1)
+        hits_ad_0110 = (s_ad_0110 == 2) & (s_ad_headtail_me == 0) & (s_ad_headtail_empty == 2)
+        seg_ad_0110 = torch.flip(F.conv_transpose2d(hits_ad_0110.unsqueeze(1).float(), kd4b, stride=1).squeeze(1), dims=[2])
+        counts = seg_h_1100 + seg_h_0110 + seg_v_1100 + seg_v_0110 + seg_d_1100 + seg_d_0110 + seg_ad_1100 + seg_ad_0110
+        return (counts >= 2).float()
 
     def _double_three(self, me, op):
         B = me.shape[0]
-        empty = (me == 0) & (op == 0)
-        cnt = torch.zeros_like(me)
-        for i in range(8):
-            for s in range(8 - 4):
-                w = me[:, i, s : s + 5]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                       (empty[:, i, s]) & (empty[:, i, s + 4])
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    cnt[idx, i, s + 1 : s + 4] += 1
-                if s == 0:
-                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    left_block = (op[:, i, s - 1] == 1) | (~empty[:, i, s - 1])
-                if s + 5 >= 8:
-                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    right_block = (op[:, i, s + 5] == 1) | (~empty[:, i, s + 5])
-                cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
-                          (empty[:, i, s + 3]) & left_block
-                idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    cnt[idx, i, s : s + 3] += 1
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                          (left_block ^ right_block)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    cnt[idx, i, s + 1 : s + 4] += 1
-        for j in range(8):
-            for s in range(8 - 4):
-                w = me[:, s : s + 5, j]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                       (empty[:, s, j]) & (empty[:, s + 4, j])
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    cnt[idx, s + 1 : s + 4, j] += 1
-                if s == 0:
-                    left_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    left_block = (op[:, s - 1, j] == 1) | (~empty[:, s - 1, j])
-                if s + 5 >= 8:
-                    right_block = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    right_block = (op[:, s + 5, j] == 1) | (~empty[:, s + 5, j])
-                cond_r1 = (w[:, 0] == 1) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 0) & (w[:, 4] == 0) & \
-                          (empty[:, s + 3, j]) & left_block
-                idx = torch.nonzero(cond_r1, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    cnt[idx, s : s + 3, j] += 1
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & \
-                          (left_block ^ right_block)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    cnt[idx, s + 1 : s + 4, j] += 1
-        for d in range(-7, 8):
-            cells = [(i, i + d) for i in range(8) if 0 <= i + d < 8]
-            L = len(cells)
-            for s in range(0, L - 4):
-                w = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(5)], dim=1)
-                e0 = empty[:, cells[s][0], cells[s][1]]
-                e4 = empty[:, cells[s + 4][0], cells[s + 4][1]]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & e0 & e4
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        cnt[idx, ii, jj] += 1
-                lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
-                if s + 5 >= L:
-                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        cnt[idx, ii, jj] += 1
-        for d in range(-7, 8):
-            cells = [(i, -i + d) for i in range(8) if 0 <= -i + d < 8]
-            L = len(cells)
-            for s in range(0, L - 4):
-                w = torch.stack([me[:, cells[s + t][0], cells[s + t][1]] for t in range(5)], dim=1)
-                e0 = empty[:, cells[s][0], cells[s][1]]
-                e4 = empty[:, cells[s + 4][0], cells[s + 4][1]]
-                cond = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & e0 & e4
-                idx = torch.nonzero(cond, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        cnt[idx, ii, jj] += 1
-                lb = (s == 0) | ((op[:, cells[s - 1][0], cells[s - 1][1]] == 1) | (~empty[:, cells[s - 1][0], cells[s - 1][1]]))
-                if s + 5 >= L:
-                    rb = torch.ones(B, dtype=torch.bool, device=me.device)
-                else:
-                    rb = (op[:, cells[s + 5][0], cells[s + 5][1]] == 1) | (~empty[:, cells[s + 5][0], cells[s + 5][1]])
-                cond_r2 = (w[:, 0] == 0) & (w[:, 1] == 1) & (w[:, 2] == 1) & (w[:, 3] == 1) & (w[:, 4] == 0) & (lb ^ rb)
-                idx = torch.nonzero(cond_r2, as_tuple=False).squeeze(1)
-                if idx.numel() > 0:
-                    for t in range(1, 4):
-                        ii, jj = cells[s + t]
-                        cnt[idx, ii, jj] += 1
-        return (cnt >= 2).float()
+        device = me.device
+        empty_bool = (me == 0) & (op == 0)
+        not_empty_bool = ~empty_bool
+        empty = empty_bool.float()
+        not_empty = not_empty_bool.float()
+        x_me = me.unsqueeze(1)
+        x_empty = empty.unsqueeze(1)
+        x_not_empty = not_empty.unsqueeze(1)
+        counts = torch.zeros_like(me)
+        # Horizontal live3: [0,1,1,1,0] with both ends empty
+        k_live3_h = torch.tensor([[[[0, 1, 1, 1, 0]]]], dtype=torch.float32, device=device)
+        hit_me_h = F.conv2d(x_me, (k_live3_h > 0).float()).squeeze(1) == 3
+        k_endL_h = torch.tensor([[[[1, 0, 0, 0, 0]]]], dtype=torch.float32, device=device)
+        k_endR_h = torch.tensor([[[[0, 0, 0, 0, 1]]]], dtype=torch.float32, device=device)
+        endL_empty_h = F.conv2d(x_empty, (k_endL_h > 0).float()).squeeze(1) == 1
+        endR_empty_h = F.conv2d(x_empty, (k_endR_h > 0).float()).squeeze(1) == 1
+        hits_live3_h = hit_me_h & endL_empty_h & endR_empty_h
+        seg_live3_h = F.conv_transpose2d(hits_live3_h.unsqueeze(1).float(), k_live3_h, stride=1).squeeze(1)
+        counts += seg_live3_h
+        # Vertical live3
+        k_live3_v = torch.tensor([[[[0], [1], [1], [1], [0]]]], dtype=torch.float32, device=device)
+        hit_me_v = F.conv2d(x_me, (k_live3_v > 0).float()).squeeze(1) == 3
+        k_endT_v = torch.tensor([[[[1], [0], [0], [0], [0]]]], dtype=torch.float32, device=device)
+        k_endB_v = torch.tensor([[[[0], [0], [0], [0], [1]]]], dtype=torch.float32, device=device)
+        endT_empty_v = F.conv2d(x_empty, (k_endT_v > 0).float()).squeeze(1) == 1
+        endB_empty_v = F.conv2d(x_empty, (k_endB_v > 0).float()).squeeze(1) == 1
+        hits_live3_v = hit_me_v & endT_empty_v & endB_empty_v
+        seg_live3_v = F.conv_transpose2d(hits_live3_v.unsqueeze(1).float(), k_live3_v, stride=1).squeeze(1)
+        counts += seg_live3_v
+        # Diagonal live3
+        k_live3_d = torch.zeros((1, 1, 5, 5), device=device); k_live3_d[0, 0, 1, 1] = 1; k_live3_d[0, 0, 2, 2] = 1; k_live3_d[0, 0, 3, 3] = 1
+        hit_me_d = F.conv2d(x_me, (k_live3_d > 0).float()).squeeze(1) == 3
+        k_end_d = torch.zeros((1, 1, 5, 5), device=device); k_end_d[0, 0, 0, 0] = 1; k_end_d[0, 0, 4, 4] = 1
+        end_empty_d = F.conv2d(x_empty, (k_end_d > 0).float()).squeeze(1) == 2
+        hits_live3_d = hit_me_d & end_empty_d
+        seg_live3_d = F.conv_transpose2d(hits_live3_d.unsqueeze(1).float(), (k_live3_d > 0).float(), stride=1).squeeze(1)
+        counts += seg_live3_d
+        # Anti-diagonal live3
+        k_live3_ad = torch.zeros((1, 1, 5, 5), device=device); k_live3_ad[0, 0, 1, 3] = 1; k_live3_ad[0, 0, 2, 2] = 1; k_live3_ad[0, 0, 3, 1] = 1
+        hit_me_ad = F.conv2d(x_me, (k_live3_ad > 0).float()).squeeze(1) == 3
+        k_end_ad = torch.zeros((1, 1, 5, 5), device=device); k_end_ad[0, 0, 0, 4] = 1; k_end_ad[0, 0, 4, 0] = 1
+        end_empty_ad = F.conv2d(x_empty, (k_end_ad > 0).float()).squeeze(1) == 2
+        hits_live3_ad = hit_me_ad & end_empty_ad
+        seg_live3_ad = F.conv_transpose2d(hits_live3_ad.unsqueeze(1).float(), (k_live3_ad > 0).float(), stride=1).squeeze(1)
+        counts += seg_live3_ad
+        # Horizontal rush3: [1,1,1,0,0] with right end empty and left prev blocked OR symmetric
+        k_rush3_hL = torch.tensor([[[[1, 1, 1, 0, 0]]]], dtype=torch.float32, device=device)
+        hit_rush3_hL = F.conv2d(x_me, (k_rush3_hL > 0).float()).squeeze(1) == 3
+        endR_empty_hL = F.conv2d(x_empty, (k_endR_h > 0).float()).squeeze(1) == 1
+        not_empty_padL = F.pad(x_not_empty, (1, 0, 0, 0), value=1.0)
+        prevL_block = F.conv2d(not_empty_padL, (k_endL_h > 0).float()).squeeze(1) == 1
+        prevL_block = torch.ones_like(hit_rush3_hL, dtype=torch.bool)
+        prevL_block[:, :, 1:] = not_empty_bool[:, :, 0:3]
+        hits_rush3_hL = hit_rush3_hL & endR_empty_hL & prevL_block
+        seg_rush3_hL = F.conv_transpose2d(hits_rush3_hL.unsqueeze(1).float(), k_rush3_hL, stride=1).squeeze(1)
+        counts += seg_rush3_hL
+        k_rush3_hR = torch.tensor([[[[0, 0, 1, 1, 1]]]], dtype=torch.float32, device=device)
+        hit_rush3_hR = F.conv2d(x_me, (k_rush3_hR > 0).float()).squeeze(1) == 3
+        endL_empty_hR = F.conv2d(x_empty, (k_endL_h > 0).float()).squeeze(1) == 1
+        not_empty_padR = F.pad(x_not_empty, (0, 1, 0, 0), value=1.0)
+        prevR_block = F.conv2d(not_empty_padR, (k_endR_h > 0).float()).squeeze(1) == 1
+        prevR_block = torch.ones_like(hit_rush3_hR, dtype=torch.bool)
+        prevR_block[:, :, 0:3] = not_empty_bool[:, :, 5:8]
+        hits_rush3_hR = hit_rush3_hR & endL_empty_hR & prevR_block
+        seg_rush3_hR = F.conv_transpose2d(hits_rush3_hR.unsqueeze(1).float(), k_rush3_hR, stride=1).squeeze(1)
+        counts += seg_rush3_hR
+        # Vertical rush3
+        k_rush3_vT = torch.tensor([[[[1], [1], [1], [0], [0]]]], dtype=torch.float32, device=device)
+        hit_rush3_vT = F.conv2d(x_me, (k_rush3_vT > 0).float()).squeeze(1) == 3
+        endB_empty_vT = F.conv2d(x_empty, (k_endB_v > 0).float()).squeeze(1) == 1
+        not_empty_padT = F.pad(x_not_empty, (0, 0, 1, 0), value=1.0)
+        prevT_block = torch.ones_like(hit_rush3_vT, dtype=torch.bool)
+        prevT_block[:, 0, :] = True
+        prevT_block[:, 1, :] = not_empty_bool[:, 0, :]
+        prevT_block[:, 2, :] = not_empty_bool[:, 1, :]
+        prevT_block[:, 3, :] = not_empty_bool[:, 2, :]
+        hits_rush3_vT = hit_rush3_vT & endB_empty_vT & prevT_block
+        seg_rush3_vT = F.conv_transpose2d(hits_rush3_vT.unsqueeze(1).float(), k_rush3_vT, stride=1).squeeze(1)
+        counts += seg_rush3_vT
+        k_rush3_vB = torch.tensor([[[[0], [0], [1], [1], [1]]]], dtype=torch.float32, device=device)
+        hit_rush3_vB = F.conv2d(x_me, (k_rush3_vB > 0).float()).squeeze(1) == 3
+        endT_empty_vB = F.conv2d(x_empty, (k_endT_v > 0).float()).squeeze(1) == 1
+        not_empty_padB = F.pad(x_not_empty, (0, 0, 0, 1), value=1.0)
+        prevB_block = torch.ones_like(hit_rush3_vB, dtype=torch.bool)
+        prevB_block[:, 0, :] = not_empty_bool[:, 5, :]
+        prevB_block[:, 1, :] = not_empty_bool[:, 6, :]
+        prevB_block[:, 2, :] = not_empty_bool[:, 7, :]
+        prevB_block[:, 3, :] = True
+        hits_rush3_vB = hit_rush3_vB & endT_empty_vB & prevB_block
+        seg_rush3_vB = F.conv_transpose2d(hits_rush3_vB.unsqueeze(1).float(), k_rush3_vB, stride=1).squeeze(1)
+        counts += seg_rush3_vB
+        # Diagonal rush3 (approximate): use diagonal kernels with end empties and prev blocked via padding
+        k_rush3_dL = torch.zeros((1, 1, 5, 5), device=device); k_rush3_dL[0, 0, 0, 0] = 1; k_rush3_dL[0, 0, 1, 1] = 1; k_rush3_dL[0, 0, 2, 2] = 1
+        hit_rush3_dL = F.conv2d(x_me, (k_rush3_dL > 0).float()).squeeze(1) == 3
+        end_dR_empty = F.conv2d(x_empty, (k_end_d > 0).float()).squeeze(1) >= 1
+        prev_dL_block = torch.ones_like(hit_rush3_dL, dtype=torch.bool)
+        prev_dL_block[:, 1:, 1:] = not_empty_bool[:, 0:3, 0:3]
+        hits_rush3_dL = hit_rush3_dL & end_dR_empty & prev_dL_block
+        seg_rush3_dL = F.conv_transpose2d(hits_rush3_dL.unsqueeze(1).float(), (k_rush3_dL > 0).float(), stride=1).squeeze(1)
+        counts += seg_rush3_dL
+        k_rush3_adL = torch.zeros((1, 1, 5, 5), device=device); k_rush3_adL[0, 0, 0, 4] = 1; k_rush3_adL[0, 0, 1, 3] = 1; k_rush3_adL[0, 0, 2, 2] = 1
+        hit_rush3_adL = F.conv2d(x_me, (k_rush3_adL > 0).float()).squeeze(1) == 3
+        end_ad_empty = F.conv2d(x_empty, (k_end_ad > 0).float()).squeeze(1) >= 1
+        prev_ad_block = torch.ones_like(hit_rush3_adL, dtype=torch.bool)
+        prev_ad_block[:, 1:, 0:3] = not_empty_bool[:, 0:3, 1:4]
+        hits_rush3_adL = hit_rush3_adL & end_ad_empty & prev_ad_block
+        seg_rush3_adL = F.conv_transpose2d(hits_rush3_adL.unsqueeze(1).float(), (k_rush3_adL > 0).float(), stride=1).squeeze(1)
+        counts += seg_rush3_adL
+        return (counts >= 2).float()
 
     def mcts_search(self, batch_tracker, side, idx, prior_pi):
         # 策略先验的MCTS：UCT选择、叶子随机rollout评估、回传更新N/W/Q

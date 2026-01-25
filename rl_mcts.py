@@ -53,7 +53,7 @@ class Trainer:
         self.baseline_def = 0.0
         self.baseline_beta = float(baseline_beta)
 
-    def train(self, model_dir="saved_models", results_dir="results", model_name="model.pth", csv_name="results.csv", json_name="episodes.json"):
+    def train(self, model_dir="saved_models", results_dir="results", model_name="model.pth", csv_name="results.csv", json_name="episodes.json", half_self_play: bool = False):
         os.makedirs(model_dir, exist_ok=True)
         os.makedirs(results_dir, exist_ok=True)
         csv_path = os.path.join(results_dir, csv_name)
@@ -85,19 +85,12 @@ class Trainer:
                 if not bool(self.env.done[0].item()):
                     s0 = int(side[0].item())
                     a0 = int(actions[0].item())
-                    p0 = float(probs[0].item())
-                    b0_before = self.env.state()[0].detach().cpu().numpy().tolist()
                     self.env.step(actions)
-                    b0_after = self.env.state()[0].detach().cpu().numpy().tolist()
                     ep_moves.append({
                         "step": steps,
                         "side": s0,
-                        "action_idx": a0,
-                        "prob": p0,
                         "x": a0 // 8,
                         "y": a0 % 8,
-                        "board_before": b0_before,
-                        "board_after": b0_after,
                     })
                 else:
                     self.env.step(actions)
@@ -108,20 +101,40 @@ class Trainer:
             winners = self.env.winners.to(self.device).float()
             r_off = winners
             r_def = -winners
-            mean_off = float(r_off.mean().item())
-            mean_def = float(r_def.mean().item())
+            if half_self_play:
+                half = self.batch_size // 2
+                idx_off = torch.arange(0, half, device=self.device)
+                idx_def = torch.arange(half, self.batch_size, device=self.device)
+                mean_off = float(r_off[idx_off].mean().item()) if idx_off.numel() > 0 else 0.0
+                mean_def = float(r_def[idx_def].mean().item()) if idx_def.numel() > 0 else 0.0
+            else:
+                mean_off = float(r_off.mean().item())
+                mean_def = float(r_def.mean().item())
             self.baseline_off = (1 - self.baseline_beta) * self.baseline_off + self.baseline_beta * mean_off
             self.baseline_def = (1 - self.baseline_beta) * self.baseline_def + self.baseline_beta * mean_def
             loss = torch.tensor(0.0, device=self.device)
-            for i in range(self.batch_size):
-                if logs_off[i]:
-                    s_off = torch.stack(logs_off[i]).sum()
-                    adv_off = r_off[i] - self.baseline_off
-                    loss = loss - adv_off * s_off
-                if logs_def[i]:
-                    s_def = torch.stack(logs_def[i]).sum()
-                    adv_def = r_def[i] - self.baseline_def
-                    loss = loss - adv_def * s_def
+            if half_self_play:
+                half = self.batch_size // 2
+                for i in range(0, half):
+                    if logs_off[i]:
+                        s_off = torch.stack(logs_off[i]).sum()
+                        adv_off = r_off[i] - self.baseline_off
+                        loss = loss - adv_off * s_off
+                for i in range(half, self.batch_size):
+                    if logs_def[i]:
+                        s_def = torch.stack(logs_def[i]).sum()
+                        adv_def = r_def[i] - self.baseline_def
+                        loss = loss - adv_def * s_def
+            else:
+                for i in range(self.batch_size):
+                    if logs_off[i]:
+                        s_off = torch.stack(logs_off[i]).sum()
+                        adv_off = r_off[i] - self.baseline_off
+                        loss = loss - adv_off * s_off
+                    if logs_def[i]:
+                        s_def = torch.stack(logs_def[i]).sum()
+                        adv_def = r_def[i] - self.baseline_def
+                        loss = loss - adv_def * s_def
             self.optim.zero_grad()
             loss.backward()
             total_abs = 0.0

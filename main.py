@@ -3,7 +3,7 @@ from rl_mcts import Trainer
 
 def main():
     # 训练规模
-    batch_size = 6
+    batch_size = 2
     episodes = 100
     max_steps = 40
     device = 'cuda'  # 'cuda' 或 'cpu'，None 自动选择
@@ -32,6 +32,7 @@ def main():
     rollout_per_leaf = 0
     rollout_max_moves = 0
     sample_policy = True  # True 时按策略采样动作，关闭MCTS
+    half_self_play = True  # True 时半监督：前半批训练先手，后半批训练后手
 
     trainer = Trainer(
         batch_size=batch_size,
@@ -59,6 +60,7 @@ def main():
         model_name=model_name,
         csv_name=csv_name,
         json_name=json_name,
+        half_self_play=half_self_play,
     )
 
 
