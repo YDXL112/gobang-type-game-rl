@@ -71,8 +71,8 @@ class Trainer:
         )
         self.opponent.load_state_dict(self.agent.state_dict())
         self.optim = torch.optim.Adam(self.agent.parameters(), lr=self.lr)
-        self.baseline_off = 0.0
-        self.baseline_def = 0.0
+        self.baseline_off = 0.8
+        self.baseline_def = -0.8
         self.baseline_beta = float(baseline_beta)
         self.eval_interval_episodes = int(eval_interval_episodes)
         self.eval_games = int(eval_games)
