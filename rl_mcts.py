@@ -15,6 +15,7 @@ class Trainer:
         max_steps=40,
         device=None,
         baseline_beta=0.1,
+        entropy_coef: float = 0.0,
         stem_kernel_size: int = 5,
         block_kernel_size: int = 3,
         channels: int = 64,
@@ -31,6 +32,7 @@ class Trainer:
         eval_interval_episodes: int = 10,
         eval_games: int = 20,
         replace_threshold: float = 0.5,
+        eval_log_name: str = "eval_log.csv",
     ):
         self.batch_size = int(batch_size)
         self.lr = float(lr)
@@ -74,39 +76,53 @@ class Trainer:
         self.baseline_off = 0.8
         self.baseline_def = -0.8
         self.baseline_beta = float(baseline_beta)
+        self.entropy_coef = float(entropy_coef)
         self.eval_interval_episodes = int(eval_interval_episodes)
         self.eval_games = int(eval_games)
         self.replace_threshold = float(replace_threshold)
+        # eval log init
+        self.eval_log_name = eval_log_name
+        self.results_dir = None
 
     def train(self, model_dir="saved_models", results_dir="results", model_name="model.pth", csv_name="results.csv", json_name="episodes.json", half_self_play: bool = False):
         os.makedirs(model_dir, exist_ok=True)
         os.makedirs(results_dir, exist_ok=True)
+        self.results_dir = results_dir
         csv_path = os.path.join(results_dir, csv_name)
         json_path = os.path.join(results_dir, json_name)
+        eval_log_path = os.path.join(results_dir, self.eval_log_name)
         csv_exists = os.path.exists(csv_path)
         if not csv_exists:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["episode", "off_win_rate", "draw_rate", "def_win_rate", "loss"])
+        if not os.path.exists(eval_log_path):
+            with open(eval_log_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["episode", "new_total_win_rate", "old_total_win_rate", "new_first_win_rate", "new_second_win_rate", "old_first_win_rate", "old_second_win_rate", "eval_games"])
         episodes_out = []
         for ep in range(1, self.episodes + 1):
             print(f"episode:{ep}")
             self.env.reset()
             logs_off = [[] for _ in range(self.batch_size)]
             logs_def = [[] for _ in range(self.batch_size)]
+            ents_off = [[] for _ in range(self.batch_size)]
+            ents_def = [[] for _ in range(self.batch_size)]
             ep_moves = []
             steps = 0
             while True:
                 state = self.env.state()
                 side = self.env.turn().to(torch.int32)
-                actions, probs = self.agent(state, side, self.env)
+                actions, probs, entropy = self.agent(state, side, self.env)
                 lp = torch.log(probs + 1e-9)
                 for i in range(self.batch_size):
                     if not bool(self.env.done[i].item()):
                         if int(side[i].item()) == 1:
                             logs_off[i].append(lp[i])
+                            ents_off[i].append(entropy[i])
                         else:
                             logs_def[i].append(lp[i])
+                            ents_def[i].append(entropy[i])
                 if not bool(self.env.done[0].item()):
                     s0 = int(side[0].item())
                     a0 = int(actions[0].item())
@@ -142,21 +158,33 @@ class Trainer:
                         s_off = torch.stack(logs_off[i]).sum()
                         adv_off = r_off[i] - self.baseline_off
                         loss = loss - adv_off * s_off
+                        if self.entropy_coef != 0.0 and ents_off[i]:
+                            h_off = torch.stack(ents_off[i]).sum()
+                            loss = loss - self.entropy_coef * h_off
                 for i in range(half, self.batch_size):
                     if logs_def[i]:
                         s_def = torch.stack(logs_def[i]).sum()
                         adv_def = r_def[i] - self.baseline_def
                         loss = loss - adv_def * s_def
+                        if self.entropy_coef != 0.0 and ents_def[i]:
+                            h_def = torch.stack(ents_def[i]).sum()
+                            loss = loss - self.entropy_coef * h_def
             else:
                 for i in range(self.batch_size):
                     if logs_off[i]:
                         s_off = torch.stack(logs_off[i]).sum()
                         adv_off = r_off[i] - self.baseline_off
                         loss = loss - adv_off * s_off
+                        if self.entropy_coef != 0.0 and ents_off[i]:
+                            h_off = torch.stack(ents_off[i]).sum()
+                            loss = loss - self.entropy_coef * h_off
                     if logs_def[i]:
                         s_def = torch.stack(logs_def[i]).sum()
                         adv_def = r_def[i] - self.baseline_def
                         loss = loss - adv_def * s_def
+                        if self.entropy_coef != 0.0 and ents_def[i]:
+                            h_def = torch.stack(ents_def[i]).sum()
+                            loss = loss - self.entropy_coef * h_def
             self.optim.zero_grad()
             loss.backward()
             total_abs = 0.0
@@ -185,8 +213,22 @@ class Trainer:
             })
             # 周期评测与替换
             if self.eval_interval_episodes > 0 and ep % self.eval_interval_episodes == 0:
-                new_rate, old_rate = self._evaluate_agents(model_dir, results_dir, self.eval_games)
-                if new_rate > old_rate and new_rate >= self.replace_threshold:
+                metrics = self._evaluate_agents(self.eval_games)
+                # write eval log
+                eval_log_path = os.path.join(results_dir, self.eval_log_name)
+                with open(eval_log_path, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        ep,
+                        metrics["new_total_win_rate"],
+                        metrics["old_total_win_rate"],
+                        metrics["new_first_win_rate"],
+                        metrics["new_second_win_rate"],
+                        metrics["old_first_win_rate"],
+                        metrics["old_second_win_rate"],
+                        int(self.eval_games),
+                    ])
+                if metrics["new_total_win_rate"] > metrics["old_total_win_rate"] and metrics["new_total_win_rate"] >= self.replace_threshold:
                     self.opponent.load_state_dict(self.agent.state_dict())
                     torch.save(self.agent.state_dict(), os.path.join(model_dir, model_name))
         torch.save(self.agent.state_dict(), os.path.join(model_dir, model_name))
@@ -195,13 +237,17 @@ class Trainer:
         return True
 
     @torch.no_grad()
-    def _evaluate_agents(self, model_dir, results_dir, eval_games: int):
+    def _evaluate_agents(self, eval_games: int):
         total = int(eval_games)
         half = max(1, total // 2)
-        wins_new = 0
-        wins_old = 0
+        wins_new_total = 0
+        wins_old_total = 0
+        wins_new_first = 0
+        wins_new_second = 0
+        wins_old_first = 0
+        wins_old_second = 0
         def play_batch(starter: str, n: int):
-            nonlocal wins_new, wins_old
+            nonlocal wins_new_total, wins_old_total, wins_new_first, wins_new_second, wins_old_first, wins_old_second
             rounds = (n + self.batch_size - 1) // self.batch_size
             for r in range(rounds):
                 self.env.reset()
@@ -223,10 +269,28 @@ class Trainer:
                     if self.env.all_done() or steps >= self.env.max_steps:
                         break
                 w = self.env.winners
-                wins_new += int((w == 1).sum().item()) if starter == "new" else int((w == -1).sum().item())
-                wins_old += int((w == 1).sum().item()) if starter == "old" else int((w == -1).sum().item())
+                if starter == "new":
+                    wn_first = int((w == 1).sum().item())
+                    wo_second = int((w == -1).sum().item())
+                    wins_new_total += wn_first
+                    wins_old_total += wo_second
+                    wins_new_first += wn_first
+                    wins_old_second += wo_second
+                else:
+                    wo_first = int((w == 1).sum().item())
+                    wn_second = int((w == -1).sum().item())
+                    wins_old_total += wo_first
+                    wins_new_total += wn_second
+                    wins_old_first += wo_first
+                    wins_new_second += wn_second
         play_batch("new", half)
         play_batch("old", total - half)
-        new_rate = wins_new / float(total)
-        old_rate = wins_old / float(total)
-        return new_rate, old_rate
+        metrics = {
+            "new_total_win_rate": wins_new_total / float(total),
+            "old_total_win_rate": wins_old_total / float(total),
+            "new_first_win_rate": wins_new_first / float(half) if half > 0 else 0.0,
+            "new_second_win_rate": wins_new_second / float(total - half) if (total - half) > 0 else 0.0,
+            "old_first_win_rate": wins_old_first / float(total - half) if (total - half) > 0 else 0.0,
+            "old_second_win_rate": wins_old_second / float(half) if half > 0 else 0.0,
+        }
+        return metrics
