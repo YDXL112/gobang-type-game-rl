@@ -1,15 +1,18 @@
+import os
+# 设置可用的显卡编号
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from rl_mcts import Trainer
 
 
 def main():
     # 训练规模
-    batch_size = 2
-    episodes = 100
+    batch_size = 2048
+    episodes = 10000
     max_steps = 40
     device = 'cuda'  # 'cuda' 或 'cpu'，None 自动选择
 
     # 优化与基线
-    lr = 1e-3
+    lr = 3e-4
     baseline_beta = 0.1
 
     # 模型与结果保存
@@ -22,8 +25,8 @@ def main():
     # Agent 网络与MCTS超参
     stem_kernel_size = 5
     block_kernel_size = 3
-    channels = 32
-    num_layers = 3
+    channels = 64
+    num_layers = 5
     activation = "relu"  # 或 'relu'
     bias = True
     mcts_num_simulations = 0
