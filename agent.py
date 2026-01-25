@@ -31,6 +31,7 @@ class Agent(nn.Module):
         self.mcts_max_depth = int(mcts_max_depth)
         self.c_puct = float(c_puct)
         self.rollout_per_leaf = int(rollout_per_leaf)
+        self.rollout_max_moves = int(rollout_max_moves)
         self.use_policy_sampling = bool(use_policy_sampling)
         self.force_win_move = bool(force_win_move)
 
@@ -69,22 +70,18 @@ class Agent(nn.Module):
             else:
                 actions = actions_sample
             probs = pi[torch.arange(state.shape[0], device=self.device), actions]
+            entropy = -(pi * torch.log(pi + 1e-9)).sum(dim=1)
         else:
-            actions_list = []
-            probs_list = []
-            for idx in range(state.shape[0]):
-                counts = self.mcts_search(batch_tracker, int(side_vec[idx].item()), idx, pi[idx])
-                if counts.sum() == 0:
-                    a = int(torch.argmax(pi[idx]).item())
-                else:
-                    a = int(torch.argmax(counts).item())
-                if self.force_win_move and bool(has_win[idx].item()):
-                    a = int(torch.argmax(win_flat[idx].float()).item())
-                actions_list.append(a)
-                probs_list.append(pi[idx, a])
-            actions = torch.tensor(actions_list, dtype=torch.int64, device=self.device)
-            probs = torch.stack(probs_list).to(self.device)
-        return actions, probs
+            counts = self.mcts_search_batched(batch_tracker, side_vec, pi)
+            actions_counts = torch.argmax(counts, dim=1)
+            if self.force_win_move:
+                win_actions = torch.argmax(win_flat.float(), dim=1)
+                actions = torch.where(has_win, win_actions, actions_counts)
+            else:
+                actions = actions_counts
+            probs = pi[torch.arange(state.shape[0], device=self.device), actions]
+            entropy = -(pi * torch.log(pi + 1e-9)).sum(dim=1)
+        return actions, probs, entropy
 
     def extract_feature(self, state, side):
         # 构造19通道特征：我/对掩码、连通度(1/2/3)*2、活2/活3/冲3/双二/双三*2、legal_mask
@@ -163,6 +160,109 @@ class Agent(nn.Module):
             seg = F.conv_transpose2d(hits.unsqueeze(1).float(), kpos, stride=1).squeeze(1) > 0
             win = win | seg
         return win
+
+    def _judge_batched(self, bd):
+        x = bd.unsqueeze(1)
+        kh = torch.ones((1, 1, 1, 4), device=self.device)
+        kv = torch.ones((1, 1, 4, 1), device=self.device)
+        kd = torch.zeros((1, 1, 4, 4), device=self.device)
+        ka = torch.zeros((1, 1, 4, 4), device=self.device)
+        kd[:, :, 0, 0] = 1.0; kd[:, :, 1, 1] = 1.0; kd[:, :, 2, 2] = 1.0; kd[:, :, 3, 3] = 1.0
+        ka[:, :, 0, 3] = 1.0; ka[:, :, 1, 2] = 1.0; ka[:, :, 2, 1] = 1.0; ka[:, :, 3, 0] = 1.0
+        sh = F.conv2d(x, kh); sv = F.conv2d(x, kv); sd = F.conv2d(x, kd); sa = F.conv2d(x, ka)
+        p1_h = (sh == 4.0).flatten(1).any(1)
+        p1_v = (sv == 4.0).flatten(1).any(1)
+        p1_d = (sd == 4.0).flatten(1).any(1)
+        p1_a = (sa == 4.0).flatten(1).any(1)
+        p2_h = (sh == -4.0).flatten(1).any(1)
+        p2_v = (sv == -4.0).flatten(1).any(1)
+        p2_d = (sd == -4.0).flatten(1).any(1)
+        p2_a = (sa == -4.0).flatten(1).any(1)
+        win1 = p1_h | p1_v | p1_d | p1_a
+        win2 = p2_h | p2_v | p2_d | p2_a
+        full = (~(bd == 0.0)).view(bd.shape[0], -1).all(1)
+        # winners: 1/-1/0
+        winners = torch.where(win1, torch.ones(bd.shape[0], device=self.device), torch.zeros(bd.shape[0], device=self.device))
+        winners = torch.where(win2 & (~win1), -torch.ones(bd.shape[0], device=self.device), winners)
+        return winners
+
+    @torch.no_grad()
+    def _rollout_batched(self, boards, side_vec, max_steps):
+        bd = boards.clone()
+        cur = side_vec.clone()
+        steps = 0
+        done = torch.zeros(bd.shape[0], dtype=torch.bool, device=self.device)
+        winners = torch.zeros(bd.shape[0], dtype=torch.float32, device=self.device)
+        while steps < max_steps and (~done).any():
+            legal = (bd == 0.0).view(bd.shape[0], -1)
+            feats = self.extract_feature(bd, cur)
+            logits = self.net(feats).flatten(1)
+            neg_inf = torch.finfo(logits.dtype).min
+            logits = torch.where(legal, logits, torch.full_like(logits, neg_inf))
+            pi = torch.softmax(logits, dim=-1)
+            # force win
+            my = (bd == cur.view(-1, 1, 1)).float()
+            empty = (bd == 0.0).float()
+            win_mask = self._winning_mask(my, empty).view(bd.shape[0], -1)
+            has_win = win_mask.any(1)
+            sampled = torch.multinomial(pi, 1).squeeze(1)
+            win_actions = torch.argmax(win_mask.float(), dim=1)
+            actions = torch.where(has_win, win_actions, sampled)
+            x = actions // 8; y = actions % 8
+            idx = torch.arange(bd.shape[0], device=self.device)
+            # apply where not done
+            valid = ~done
+            bd[valid, x[valid], y[valid]] = cur[valid]
+            w = self._judge_batched(bd)
+            newly_done = (w != 0) | (~(bd == 0.0).view(bd.shape[0], -1).any(1))
+            winners = torch.where(newly_done & (~done), w.float(), winners)
+            done = done | newly_done
+            cur = torch.where(valid, -cur, cur)
+            steps += 1
+        # value from perspective cur at start: need original side_vec
+        # Here side_vec is original mover; v = 1 if winners==side_vec; -1 if -side_vec; else 0
+        v = torch.where(winners == side_vec, torch.ones_like(winners), torch.zeros_like(winners))
+        v = torch.where(winners == -side_vec, -torch.ones_like(winners), v)
+        return v
+
+    def mcts_search_batched(self, batch_tracker, side_vec, prior_pi):
+        B = side_vec.shape[0]
+        board = batch_tracker.board.clone().to(self.device)
+        P = prior_pi.clone()
+        N = torch.zeros((B, 64), dtype=torch.float32, device=self.device)
+        W = torch.zeros((B, 64), dtype=torch.float32, device=self.device)
+        Q = torch.zeros((B, 64), dtype=torch.float32, device=self.device)
+        for _ in range(self.mcts_num_simulations):
+            legal = (board == 0.0).view(B, -1)
+            uct = Q + self.c_puct * P * torch.sqrt(torch.clamp(N.sum(dim=1, keepdim=True), min=1.0)) / (1.0 + N)
+            neg_inf = torch.finfo(uct.dtype).min
+            uct = torch.where(legal, uct, torch.full_like(uct, neg_inf))
+            a = torch.argmax(uct, dim=1)
+            # force win
+            my = (board == side_vec.view(-1, 1, 1)).float()
+            empty = (board == 0.0).float()
+            win_mask = self._winning_mask(my, empty).view(B, -1)
+            has_win = win_mask.any(1)
+            win_actions = torch.argmax(win_mask.float(), dim=1)
+            a = torch.where(has_win, win_actions, a)
+            x = a // 8; y = a % 8
+            idx = torch.arange(B, device=self.device)
+            new_bd = board.clone()
+            new_bd[idx, x, y] = side_vec[idx]
+            w = self._judge_batched(new_bd)
+            term = (w != 0)
+            v = torch.zeros(B, dtype=torch.float32, device=self.device)
+            v = torch.where(term & (w == side_vec), torch.ones_like(v), v)
+            v = torch.where(term & (w == -side_vec), -torch.ones_like(v), v)
+            need_rollout = ~term
+            if need_rollout.any():
+                v_roll = self._rollout_batched(new_bd[need_rollout], side_vec[need_rollout], self.rollout_max_moves)
+                v = torch.where(need_rollout, v_roll, v)
+            # back to root stats
+            N[idx, a] = N[idx, a] + 1.0
+            W[idx, a] = W[idx, a] + v
+            Q[idx, a] = W[idx, a] / N[idx, a]
+        return N
 
     def _connectivity_channels(self, mask, Ns):
         B = mask.shape[0]

@@ -34,9 +34,11 @@ def main():
     sample_policy = True  # True 时按策略采样动作，关闭MCTS
     half_self_play = True  # True 时半监督：前半批训练先手，后半批训练后手
     force_win_move = True  # True 时优先选择一步致胜动作
-    eval_interval_episodes = 10  # 每隔多少集进行一次新旧模型评测
-    eval_games = 20  # 评测对弈局数
+    eval_interval_episodes = 1  # 每隔多少集进行一次新旧模型评测
+    eval_games = 2  # 评测对弈局数
     replace_threshold = 0.5  # 新模型胜率至少达到该阈值才替换旧模型
+    entropy_coef = 0.01  # 策略熵正则系数，鼓励探索
+    eval_log_name = "eval_log.csv"  # 评测日志文件名
 
     trainer = Trainer(
         batch_size=batch_size,
@@ -61,6 +63,8 @@ def main():
         eval_interval_episodes=eval_interval_episodes,
         eval_games=eval_games,
         replace_threshold=replace_threshold,
+        entropy_coef=entropy_coef,
+        eval_log_name=eval_log_name,
     )
     trainer.train(
         model_dir=model_dir,
