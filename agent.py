@@ -257,7 +257,9 @@ class Agent(nn.Module):
             need_rollout = ~term
             if need_rollout.any():
                 v_roll = self._rollout_batched(new_bd[need_rollout], side_vec[need_rollout], self.rollout_max_moves)
-                v = torch.where(need_rollout, v_roll, v)
+                v_tmp = v.clone()
+                v_tmp[need_rollout] = v_roll
+                v = v_tmp
             # back to root stats
             N[idx, a] = N[idx, a] + 1.0
             W[idx, a] = W[idx, a] + v

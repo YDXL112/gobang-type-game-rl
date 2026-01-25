@@ -257,8 +257,8 @@ class Trainer:
                     state = self.env.state()
                     side = self.env.turn().to(torch.int32)
                     # 两个模型分别给出动作
-                    a_new, _ = self.agent(state, side, self.env)
-                    a_old, _ = self.opponent(state, side, self.env)
+                    a_new = self.agent(state, side, self.env)[0]
+                    a_old = self.opponent(state, side, self.env)[0]
                     # 按先手分配当前回合动作来源
                     if starter == "new":
                         cur = torch.where(side.view(-1) == 1, a_new, a_old)
