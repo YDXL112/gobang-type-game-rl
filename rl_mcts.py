@@ -27,6 +27,10 @@ class Trainer:
         rollout_per_leaf: int = 16,
         rollout_max_moves: int = 64,
         use_policy_sampling: bool = False,
+        force_win_move: bool = True,
+        eval_interval_episodes: int = 10,
+        eval_games: int = 20,
+        replace_threshold: float = 0.5,
     ):
         self.batch_size = int(batch_size)
         self.lr = float(lr)
@@ -46,12 +50,33 @@ class Trainer:
             rollout_per_leaf=rollout_per_leaf,
             rollout_max_moves=rollout_max_moves,
             use_policy_sampling=use_policy_sampling,
+            force_win_move=force_win_move,
             device=self.device,
         )
+        self.opponent = Agent(
+            stem_kernel_size=stem_kernel_size,
+            block_kernel_size=block_kernel_size,
+            channels=channels,
+            num_layers=num_layers,
+            activation=activation,
+            bias=bias,
+            mcts_num_simulations=mcts_num_simulations,
+            mcts_max_depth=mcts_max_depth,
+            c_puct=c_puct,
+            rollout_per_leaf=rollout_per_leaf,
+            rollout_max_moves=rollout_max_moves,
+            use_policy_sampling=use_policy_sampling,
+            force_win_move=force_win_move,
+            device=self.device,
+        )
+        self.opponent.load_state_dict(self.agent.state_dict())
         self.optim = torch.optim.Adam(self.agent.parameters(), lr=self.lr)
         self.baseline_off = 0.0
         self.baseline_def = 0.0
         self.baseline_beta = float(baseline_beta)
+        self.eval_interval_episodes = int(eval_interval_episodes)
+        self.eval_games = int(eval_games)
+        self.replace_threshold = float(replace_threshold)
 
     def train(self, model_dir="saved_models", results_dir="results", model_name="model.pth", csv_name="results.csv", json_name="episodes.json", half_self_play: bool = False):
         os.makedirs(model_dir, exist_ok=True)
@@ -104,14 +129,11 @@ class Trainer:
             if half_self_play:
                 half = self.batch_size // 2
                 idx_off = torch.arange(0, half, device=self.device)
-                idx_def = torch.arange(half, self.batch_size, device=self.device)
                 mean_off = float(r_off[idx_off].mean().item()) if idx_off.numel() > 0 else 0.0
-                mean_def = float(r_def[idx_def].mean().item()) if idx_def.numel() > 0 else 0.0
             else:
                 mean_off = float(r_off.mean().item())
-                mean_def = float(r_def.mean().item())
             self.baseline_off = (1 - self.baseline_beta) * self.baseline_off + self.baseline_beta * mean_off
-            self.baseline_def = (1 - self.baseline_beta) * self.baseline_def + self.baseline_beta * mean_def
+            self.baseline_def = -self.baseline_off
             loss = torch.tensor(0.0, device=self.device)
             if half_self_play:
                 half = self.batch_size // 2
@@ -161,7 +183,50 @@ class Trainer:
                 "steps": len(ep_moves),
                 "moves": ep_moves,
             })
+            # 周期评测与替换
+            if self.eval_interval_episodes > 0 and ep % self.eval_interval_episodes == 0:
+                new_rate, old_rate = self._evaluate_agents(model_dir, results_dir, self.eval_games)
+                if new_rate > old_rate and new_rate >= self.replace_threshold:
+                    self.opponent.load_state_dict(self.agent.state_dict())
+                    torch.save(self.agent.state_dict(), os.path.join(model_dir, model_name))
         torch.save(self.agent.state_dict(), os.path.join(model_dir, model_name))
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump({"episodes": episodes_out}, f, ensure_ascii=False)
         return True
+
+    @torch.no_grad()
+    def _evaluate_agents(self, model_dir, results_dir, eval_games: int):
+        total = int(eval_games)
+        half = max(1, total // 2)
+        wins_new = 0
+        wins_old = 0
+        def play_batch(starter: str, n: int):
+            nonlocal wins_new, wins_old
+            rounds = (n + self.batch_size - 1) // self.batch_size
+            for r in range(rounds):
+                self.env.reset()
+                games_in_batch = min(self.batch_size, n - r * self.batch_size)
+                steps = 0
+                while True:
+                    state = self.env.state()
+                    side = self.env.turn().to(torch.int32)
+                    # 两个模型分别给出动作
+                    a_new, _ = self.agent(state, side, self.env)
+                    a_old, _ = self.opponent(state, side, self.env)
+                    # 按先手分配当前回合动作来源
+                    if starter == "new":
+                        cur = torch.where(side.view(-1) == 1, a_new, a_old)
+                    else:
+                        cur = torch.where(side.view(-1) == 1, a_old, a_new)
+                    self.env.step(cur)
+                    steps += 1
+                    if self.env.all_done() or steps >= self.env.max_steps:
+                        break
+                w = self.env.winners
+                wins_new += int((w == 1).sum().item()) if starter == "new" else int((w == -1).sum().item())
+                wins_old += int((w == 1).sum().item()) if starter == "old" else int((w == -1).sum().item())
+        play_batch("new", half)
+        play_batch("old", total - half)
+        new_rate = wins_new / float(total)
+        old_rate = wins_old / float(total)
+        return new_rate, old_rate

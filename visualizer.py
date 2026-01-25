@@ -46,14 +46,12 @@ def visualize(json_path, episode_index, interval_ms=400):
 
 def main():
     parser = argparse.ArgumentParser(description="Visualize episode moves from results JSON")
-    parser.add_argument("json_path", type=str, help="Path to results JSON (e.g., results/episodes.json)")
-    parser.add_argument("episode", type=int, help="Episode index to visualize")
-    parser.add_argument("--interval", type=int, default=400, help="Interval between frames in ms")
+    parser.add_argument("--json_path", type=str, default="results/run200.json", help="Path to results JSON")
+    parser.add_argument("--episode", type=int, default=609, help="Episode index to visualize")
+    parser.add_argument("--interval", type=int, default=2000, help="Interval between frames in ms")
     args = parser.parse_args()
     visualize(args.json_path, args.episode, args.interval)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 1:
-        print("Usage: python visualizer.py results/episodes.json 1 --interval 400")
     main()

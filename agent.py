@@ -20,17 +20,19 @@ class Agent(nn.Module):
         rollout_per_leaf: int = 16,
         rollout_max_moves: int = 64,
         use_policy_sampling: bool = False,
+        force_win_move: bool = True,
         device=None,
     ):
         super().__init__()
         self.device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # 策略网络（输入固定18通道特征，输出[1,8,8] logits）
-        self.net = PolicyValueNet(in_channels=18, stem_kernel_size=stem_kernel_size, block_kernel_size=block_kernel_size, channels=channels, num_layers=num_layers, activation=activation, bias=bias).to(self.device)
+        # 策略网络（输入固定19通道特征，输出[1,8,8] logits）
+        self.net = PolicyValueNet(in_channels=19, stem_kernel_size=stem_kernel_size, block_kernel_size=block_kernel_size, channels=channels, num_layers=num_layers, activation=activation, bias=bias).to(self.device)
         self.mcts_num_simulations = int(mcts_num_simulations)
         self.mcts_max_depth = int(mcts_max_depth)
         self.c_puct = float(c_puct)
         self.rollout_per_leaf = int(rollout_per_leaf)
         self.use_policy_sampling = bool(use_policy_sampling)
+        self.force_win_move = bool(force_win_move)
 
     def forward(self, state, side, batch_tracker):
         # 前向：特征→logits→掩码→softmax；用MCTS基于根节点N选动作，返回动作及其策略概率
@@ -47,8 +49,25 @@ class Agent(nn.Module):
         neg_inf = torch.finfo(flat_logits.dtype).min
         flat_logits = torch.where(mask, flat_logits, torch.full_like(flat_logits, neg_inf))
         pi = torch.softmax(flat_logits, dim=-1)
+        # 制胜动作优先
+        if self.force_win_move:
+            b = state.clone()
+            side_t = side_vec.view(-1, 1, 1)
+            my = (b == side_t).float()
+            empty = (b == 0.0).float()
+            win_mask = self._winning_mask(my, empty)  # [B,8,8] bool
+            win_flat = win_mask.view(win_mask.shape[0], -1)
+            has_win = win_flat.any(dim=1)
+        else:
+            has_win = torch.zeros(state.shape[0], dtype=torch.bool, device=self.device)
         if self.use_policy_sampling or self.mcts_num_simulations <= 0:
-            actions = torch.multinomial(pi, 1).squeeze(1)
+            actions_sample = torch.multinomial(pi, 1).squeeze(1)
+            if self.force_win_move:
+                # 用制胜动作替换采样动作
+                win_actions = torch.argmax(win_flat.float(), dim=1)
+                actions = torch.where(has_win, win_actions, actions_sample)
+            else:
+                actions = actions_sample
             probs = pi[torch.arange(state.shape[0], device=self.device), actions]
         else:
             actions_list = []
@@ -59,6 +78,8 @@ class Agent(nn.Module):
                     a = int(torch.argmax(pi[idx]).item())
                 else:
                     a = int(torch.argmax(counts).item())
+                if self.force_win_move and bool(has_win[idx].item()):
+                    a = int(torch.argmax(win_flat[idx].float()).item())
                 actions_list.append(a)
                 probs_list.append(pi[idx, a])
             actions = torch.tensor(actions_list, dtype=torch.int64, device=self.device)
@@ -66,7 +87,7 @@ class Agent(nn.Module):
         return actions, probs
 
     def extract_feature(self, state, side):
-        # 构造18通道特征：我/对掩码、连通度(1/2/3)*2、活2/活3/冲3/双二/双三*2
+        # 构造19通道特征：我/对掩码、连通度(1/2/3)*2、活2/活3/冲3/双二/双三*2、legal_mask
         b = state.clone()
         side_t = side.view(-1, 1, 1)
         my = (b == side_t).float()
@@ -88,8 +109,60 @@ class Agent(nn.Module):
         feats.append(rush3_op)
         feats.append(self._double_two(op, my))
         feats.append(self._double_three(op, my))
+        feats.append((b == 0.0).float())
         x = torch.stack(feats, dim=1)
         return x
+
+    def _winning_mask(self, me, empty):
+        device = me.device
+        x_me = me.unsqueeze(1)
+        x_empty = empty.unsqueeze(1)
+        win = torch.zeros_like(me, dtype=torch.bool)
+        # horizontal
+        kh = torch.ones((1, 1, 1, 4), device=device)
+        sumH = F.conv2d(x_me, kh).squeeze(1) == 3
+        pos_k = [torch.tensor([[[[1, 0, 0, 0]]]], dtype=torch.float32, device=device),
+                 torch.tensor([[[[0, 1, 0, 0]]]], dtype=torch.float32, device=device),
+                 torch.tensor([[[[0, 0, 1, 0]]]], dtype=torch.float32, device=device),
+                 torch.tensor([[[[0, 0, 0, 1]]]], dtype=torch.float32, device=device)]
+        for p in range(4):
+            ep = F.conv2d(x_empty, (pos_k[p] > 0).float()).squeeze(1) == 1
+            hits = sumH & ep
+            seg = F.conv_transpose2d(hits.unsqueeze(1).float(), pos_k[p], stride=1).squeeze(1) > 0
+            win = win | seg
+        # vertical
+        kv = torch.ones((1, 1, 4, 1), device=device)
+        sumV = F.conv2d(x_me, kv).squeeze(1) == 3
+        pos_v = [torch.tensor([[[[1], [0], [0], [0]]]], dtype=torch.float32, device=device),
+                 torch.tensor([[[[0], [1], [0], [0]]]], dtype=torch.float32, device=device),
+                 torch.tensor([[[[0], [0], [1], [0]]]], dtype=torch.float32, device=device),
+                 torch.tensor([[[[0], [0], [0], [1]]]], dtype=torch.float32, device=device)]
+        for p in range(4):
+            ep = F.conv2d(x_empty, (pos_v[p] > 0).float()).squeeze(1) == 1
+            hits = sumV & ep
+            seg = F.conv_transpose2d(hits.unsqueeze(1).float(), pos_v[p], stride=1).squeeze(1) > 0
+            win = win | seg
+        # main diagonal
+        kd = torch.zeros((1, 1, 4, 4), device=device)
+        for t in range(4): kd[0, 0, t, t] = 1.0
+        sumD = F.conv2d(x_me, kd).squeeze(1) == 3
+        for t in range(4):
+            kpos = torch.zeros((1, 1, 4, 4), device=device); kpos[0, 0, t, t] = 1.0
+            ep = F.conv2d(x_empty, (kpos > 0).float()).squeeze(1) == 1
+            hits = sumD & ep
+            seg = F.conv_transpose2d(hits.unsqueeze(1).float(), kpos, stride=1).squeeze(1) > 0
+            win = win | seg
+        # anti diagonal
+        ka = torch.zeros((1, 1, 4, 4), device=device)
+        for t in range(4): ka[0, 0, t, 3 - t] = 1.0
+        sumA = F.conv2d(x_me, ka).squeeze(1) == 3
+        for t in range(4):
+            kpos = torch.zeros((1, 1, 4, 4), device=device); kpos[0, 0, t, 3 - t] = 1.0
+            ep = F.conv2d(x_empty, (kpos > 0).float()).squeeze(1) == 1
+            hits = sumA & ep
+            seg = F.conv_transpose2d(hits.unsqueeze(1).float(), kpos, stride=1).squeeze(1) > 0
+            win = win | seg
+        return win
 
     def _connectivity_channels(self, mask, Ns):
         B = mask.shape[0]
