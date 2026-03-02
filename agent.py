@@ -194,28 +194,26 @@ class Agent(nn.Module):
 
         # 水平方向：检查 _XX_ 模式
         for pattern, pos_idx in [
-            (torch.tensor([[[[0, 1, 1, 0]]]], device=device), [0, 3]),  # _11_
+            (torch.tensor([[[[0, 1, 1, 0]]]], dtype=torch.float32, device=device), [0, 3]),  # _11_
         ]:
             conv_result = F.conv2d(x_me, pattern)
             hits = (conv_result.squeeze(1) == float(n - 1))
             # 标记能形成威胁的位置
             for pos in pos_idx:
-                expanded = F.conv_transpose2d(
-                    hits.unsqueeze(1).float(),
-                    torch.zeros(1, 1, 1, 4, device=device).scatter_(3, torch.tensor([pos], device=device), 1.0),
-                    stride=1
-                ).squeeze(1)
+                k = torch.zeros(1, 1, 1, 4, dtype=torch.float32, device=device)
+                k[0, 0, 0, pos] = 1.0
+                expanded = F.conv_transpose2d(hits.unsqueeze(1).float(), k, stride=1).squeeze(1)
                 threat = torch.max(threat, expanded)
 
         # 垂直方向
         for pattern, pos_idx in [
-            (torch.tensor([[[[0], [1], [1], [0]]]], device=device), [0, 3]),
+            (torch.tensor([[[[0], [1], [1], [0]]]], dtype=torch.float32, device=device), [0, 3]),
         ]:
             conv_result = F.conv2d(x_me, pattern)
             hits = (conv_result.squeeze(1) == float(n - 1))
             for pos in pos_idx:
-                k = torch.zeros(1, 1, 4, 1, device=device)
-                k[pos, 0, :, 0] = 1.0
+                k = torch.zeros(1, 1, 4, 1, dtype=torch.float32, device=device)
+                k[0, 0, pos, 0] = 1.0
                 expanded = F.conv_transpose2d(hits.unsqueeze(1).float(), k, stride=1).squeeze(1)
                 threat = torch.max(threat, expanded)
 
