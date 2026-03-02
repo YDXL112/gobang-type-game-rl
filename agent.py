@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from layers import PolicyValueNet
-# Agent：单权重自博弈；基于策略先验的MCTS与随机rollout
+# Agent：单权重自博弈；基于策略先验的MCTS与价值网络
 
 
 class Agent(nn.Module):
@@ -25,8 +25,8 @@ class Agent(nn.Module):
     ):
         super().__init__()
         self.device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # 策略网络（输入固定19通道特征，输出[1,8,8] logits）
-        self.net = PolicyValueNet(in_channels=19, stem_kernel_size=stem_kernel_size, block_kernel_size=block_kernel_size, channels=channels, num_layers=num_layers, activation=activation, bias=bias).to(self.device)
+        # 策略-价值网络（输入27通道特征：原19 + 新增8通道威胁特征）
+        self.net = PolicyValueNet(in_channels=27, stem_kernel_size=stem_kernel_size, block_kernel_size=block_kernel_size, channels=channels, num_layers=num_layers, activation=activation, bias=bias).to(self.device)
         self.mcts_num_simulations = int(mcts_num_simulations)
         self.mcts_max_depth = int(mcts_max_depth)
         self.c_puct = float(c_puct)
@@ -36,7 +36,14 @@ class Agent(nn.Module):
         self.force_win_move = bool(force_win_move)
 
     def forward(self, state, side, batch_tracker):
-        # 前向：特征→logits→掩码→softmax；用MCTS基于根节点N选动作，返回动作及其策略概率
+        """
+        前向推理：返回动作、策略概率、熵、以及价值估计
+        Returns:
+            actions: 选择的动作 [B]
+            probs: 动作对应的概率 [B]
+            entropy: 策略熵 [B]
+            value: 局面价值估计 [B]，范围[-1,1]
+        """
         state = torch.tensor(state, dtype=torch.float32, device=self.device) if not isinstance(state, torch.Tensor) else state.to(self.device).float()
         if isinstance(side, torch.Tensor):
             side_vec = side.to(self.device).view(-1).float()
@@ -44,71 +51,212 @@ class Agent(nn.Module):
             side_vec = torch.full((state.shape[0],), float(int(side)), device=self.device)
         legal = batch_tracker.legal_mask().to(self.device)
         feats = self.extract_feature(state, side_vec)
-        logits = self.net(feats)
+        logits, value = self.net(feats)  # 现在网络返回两个值
         flat_logits = logits.flatten(1)
         mask = legal.view(legal.shape[0], -1)
         neg_inf = torch.finfo(flat_logits.dtype).min
         flat_logits = torch.where(mask, flat_logits, torch.full_like(flat_logits, neg_inf))
         pi = torch.softmax(flat_logits, dim=-1)
-        # 制胜动作优先
-        if self.force_win_move:
-            b = state.clone()
-            side_t = side_vec.view(-1, 1, 1)
-            my = (b == side_t).float()
-            empty = (b == 0.0).float()
-            win_mask = self._winning_mask(my, empty)  # [B,8,8] bool
-            win_flat = win_mask.view(win_mask.shape[0], -1)
-            has_win = win_flat.any(dim=1)
-        else:
-            has_win = torch.zeros(state.shape[0], dtype=torch.bool, device=self.device)
+
+        # 获取我的制胜位置和对手的制胜位置（需要阻挡）
+        b = state.clone()
+        side_t = side_vec.view(-1, 1, 1)
+        my = (b == side_t).float()
+        op = (b == -side_t).float()
+        empty = (b == 0.0).float()
+
+        # 我的制胜位置
+        my_win_mask = self._winning_mask(my, empty)
+        my_win_flat = my_win_mask.view(my_win_mask.shape[0], -1)
+        has_my_win = my_win_flat.any(dim=1)
+
+        # 对手的制胜位置（必须阻挡！）
+        op_win_mask = self._winning_mask(op, empty)
+        op_win_flat = op_win_mask.view(op_win_mask.shape[0], -1)
+        has_op_win = op_win_flat.any(dim=1)
+
+        # 优先级：自己能赢 > 阻挡对手 > 正常选择
         if self.use_policy_sampling or self.mcts_num_simulations <= 0:
             actions_sample = torch.multinomial(pi, 1).squeeze(1)
-            if self.force_win_move:
-                # 用制胜动作替换采样动作
-                win_actions = torch.argmax(win_flat.float(), dim=1)
-                actions = torch.where(has_win, win_actions, actions_sample)
-            else:
-                actions = actions_sample
+            # 优先选择制胜动作
+            my_win_actions = torch.argmax(my_win_flat.float(), dim=1)
+            # 其次选择阻挡动作
+            op_win_actions = torch.argmax(op_win_flat.float(), dim=1)
+            # 优先级：自己赢 > 阻挡对手 > 正常采样
+            actions = torch.where(has_my_win, my_win_actions,
+                                  torch.where(has_op_win, op_win_actions, actions_sample))
             probs = pi[torch.arange(state.shape[0], device=self.device), actions]
-            entropy = -(pi * torch.log(pi + 1e-9)).sum(dim=1)
         else:
-            counts = self.mcts_search_batched(batch_tracker, side_vec, pi)
+            counts = self.mcts_search_batched(batch_tracker, side_vec, pi, value)
             actions_counts = torch.argmax(counts, dim=1)
-            if self.force_win_move:
-                win_actions = torch.argmax(win_flat.float(), dim=1)
-                actions = torch.where(has_win, win_actions, actions_counts)
-            else:
-                actions = actions_counts
+            my_win_actions = torch.argmax(my_win_flat.float(), dim=1)
+            op_win_actions = torch.argmax(op_win_flat.float(), dim=1)
+            actions = torch.where(has_my_win, my_win_actions,
+                                  torch.where(has_op_win, op_win_actions, actions_counts))
             probs = pi[torch.arange(state.shape[0], device=self.device), actions]
-            entropy = -(pi * torch.log(pi + 1e-9)).sum(dim=1)
-        return actions, probs, entropy
+
+        entropy = -(pi * torch.log(pi + 1e-9)).sum(dim=1)
+        value = value.squeeze(-1)  # [B, 1] -> [B]
+        return actions, probs, entropy, value
 
     def extract_feature(self, state, side):
-        # 构造19通道特征：我/对掩码、连通度(1/2/3)*2、活2/活3/冲3/双二/双三*2、legal_mask
+        """
+        构造27通道特征：
+        原有19通道：
+          - 我/对掩码 (2)
+          - 连通度(1/2/3)*2 (6)
+          - 活2/活3/冲3/双二/双三*2 (10)
+          - legal_mask (1)
+        新增8通道威胁特征：
+          - 我的制胜位置 (1)
+          - 对手制胜位置/必须阻挡 (1)
+          - 我的活三威胁位置 (1)
+          - 对手活三威胁位置 (1)
+          - 我的冲四位置 (1)
+          - 对手冲四位置 (1)
+          - 我的双三位置 (1)
+          - 对手双三位置 (1)
+        """
         b = state.clone()
         side_t = side.view(-1, 1, 1)
         my = (b == side_t).float()
         op = (b == -side_t).float()
+        empty = (b == 0.0).float()
+
         feats = []
-        feats.append(my)
-        feats.append(op)
-        feats += self._connectivity_channels(my, [1, 2, 3])
-        feats += self._connectivity_channels(op, [1, 2, 3])
+        # === 原有特征 (19通道) ===
+        feats.append(my)  # 0: 我的棋子
+        feats.append(op)  # 1: 对手棋子
+        feats += self._connectivity_channels(my, [1, 2, 3])  # 2-4: 我的连通度
+        feats += self._connectivity_channels(op, [1, 2, 3])  # 5-7: 对手连通度
         live2_my, live3_my, rush3_my = self._live_rush(my, op)
         live2_op, live3_op, rush3_op = self._live_rush(op, my)
-        feats.append(live2_my)
-        feats.append(live3_my)
-        feats.append(rush3_my)
-        feats.append(self._double_two(my, op))
-        feats.append(self._double_three(my, op))
-        feats.append(live2_op)
-        feats.append(live3_op)
-        feats.append(rush3_op)
-        feats.append(self._double_two(op, my))
-        feats.append(self._double_three(op, my))
-        feats.append((b == 0.0).float())
+        feats.append(live2_my)   # 8
+        feats.append(live3_my)   # 9
+        feats.append(rush3_my)   # 10
+        feats.append(self._double_two(my, op))   # 11
+        feats.append(self._double_three(my, op)) # 12
+        feats.append(live2_op)   # 13
+        feats.append(live3_op)   # 14
+        feats.append(rush3_op)   # 15
+        feats.append(self._double_two(op, my))   # 16
+        feats.append(self._double_three(op, my)) # 17
+        feats.append(empty)  # 18: 空位
+
+        # === 新增威胁特征 (8通道) ===
+        # 19: 我的制胜位置（一步能赢）
+        my_win = self._winning_mask(my, empty).float()
+        feats.append(my_win)
+
+        # 20: 对手制胜位置（必须阻挡！）
+        op_win = self._winning_mask(op, empty).float()
+        feats.append(op_win)
+
+        # 21: 我的活三威胁位置（下一步能形成活三的位置）
+        my_live3_threat = self._threat_positions(my, op, empty, n=3)
+        feats.append(my_live3_threat)
+
+        # 22: 对手活三威胁位置（需要预先阻挡）
+        op_live3_threat = self._threat_positions(op, my, empty, n=3)
+        feats.append(op_live3_threat)
+
+        # 23: 我的冲四位置（已有三子且一端被堵，但另一端空）
+        my_rush4 = self._rush_four_positions(my, op, empty)
+        feats.append(my_rush4)
+
+        # 24: 对手冲四位置
+        op_rush4 = self._rush_four_positions(op, my, empty)
+        feats.append(op_rush4)
+
+        # 25: 我的双三威胁位置
+        my_double3 = self._double_three(my, op)
+        feats.append(my_double3)
+
+        # 26: 对手双三威胁位置
+        op_double3 = self._double_three(op, my)
+        feats.append(op_double3)
+
         x = torch.stack(feats, dim=1)
         return x
+
+    def _threat_positions(self, me, op, empty, n=3):
+        """
+        找出能形成n连威胁的位置
+        对于n=3，找出放置一子后能形成活三的位置
+        """
+        B = me.shape[0]
+        device = me.device
+        threat = torch.zeros_like(me)
+
+        # 检查每个空位：如果在这里放子，是否会形成n连且两端有空
+        # 简化实现：检查 [空, 我, 我, 空] 这种模式中空位的位置
+        x_me = me.unsqueeze(1)
+
+        # 水平方向：检查 _XX_ 模式
+        for pattern, pos_idx in [
+            (torch.tensor([[[[0, 1, 1, 0]]]], device=device), [0, 3]),  # _11_
+        ]:
+            conv_result = F.conv2d(x_me, pattern)
+            hits = (conv_result.squeeze(1) == float(n - 1))
+            # 标记能形成威胁的位置
+            for pos in pos_idx:
+                expanded = F.conv_transpose2d(
+                    hits.unsqueeze(1).float(),
+                    torch.zeros(1, 1, 1, 4, device=device).scatter_(3, torch.tensor([pos], device=device), 1.0),
+                    stride=1
+                ).squeeze(1)
+                threat = torch.max(threat, expanded)
+
+        # 垂直方向
+        for pattern, pos_idx in [
+            (torch.tensor([[[[0], [1], [1], [0]]]], device=device), [0, 3]),
+        ]:
+            conv_result = F.conv2d(x_me, pattern)
+            hits = (conv_result.squeeze(1) == float(n - 1))
+            for pos in pos_idx:
+                k = torch.zeros(1, 1, 4, 1, device=device)
+                k[pos, 0, :, 0] = 1.0
+                expanded = F.conv_transpose2d(hits.unsqueeze(1).float(), k, stride=1).squeeze(1)
+                threat = torch.max(threat, expanded)
+
+        return threat
+
+    def _rush_four_positions(self, me, op, empty):
+        """
+        找出冲四位置：已有三子连成一线，一端被堵，另一端空
+        模式：X111_ 或 _111X（X=对手或边界，_=空）
+        """
+        B = me.shape[0]
+        device = me.device
+        rush4 = torch.zeros_like(me)
+
+        x_me = me.unsqueeze(1)
+        x_op = op.unsqueeze(1)
+        x_empty = empty.unsqueeze(1)
+
+        # 水平方向：检查 111_ 和 _111 模式
+        # 冲四：三连且一端有对手或边界
+        k3 = torch.ones((1, 1, 1, 3), device=device)
+        sum3 = F.conv2d(x_me, k3).squeeze(1)  # 三连位置
+
+        # 左端被堵，右端空
+        left_blocked = F.pad(x_op, (1, 0), value=0.0)
+        right_empty = F.pad(x_empty, (0, 1), value=0.0)
+
+        # 简化：标记有三连的位置附近的空位
+        hits = (sum3 == 3.0)
+        # 扩展到原始位置
+        expanded = F.conv_transpose2d(hits.unsqueeze(1).float(), k3, stride=1).squeeze(1)
+        rush4 = torch.where((expanded > 0) & (empty > 0), torch.ones_like(rush4), rush4)
+
+        # 垂直方向
+        k3v = torch.ones((1, 1, 3, 1), device=device)
+        sum3v = F.conv2d(x_me, k3v).squeeze(1)
+        hits_v = (sum3v == 3.0)
+        expanded_v = F.conv_transpose2d(hits_v.unsqueeze(1).float(), k3v, stride=1).squeeze(1)
+        rush4 = torch.where((expanded_v > 0) & (empty > 0), torch.ones_like(rush4), rush4)
+
+        return rush4
 
     def _winning_mask(self, me, empty):
         device = me.device
@@ -225,45 +373,70 @@ class Agent(nn.Module):
         v = torch.where(winners == -side_vec, -torch.ones_like(winners), v)
         return v
 
-    def mcts_search_batched(self, batch_tracker, side_vec, prior_pi):
+    def mcts_search_batched(self, batch_tracker, side_vec, prior_pi, root_value):
+        """
+        批量MCTS搜索，使用价值网络评估叶子节点（替代rollout）
+        Args:
+            batch_tracker: 环境实例
+            side_vec: 当前玩家 [B]
+            prior_pi: 策略先验 [B, 64]
+            root_value: 根节点的价值估计 [B]
+        Returns:
+            N: 每个动作的访问次数 [B, 64]
+        """
         B = side_vec.shape[0]
         board = batch_tracker.board.clone().to(self.device)
         P = prior_pi.clone()
         N = torch.zeros((B, 64), dtype=torch.float32, device=self.device)
         W = torch.zeros((B, 64), dtype=torch.float32, device=self.device)
         Q = torch.zeros((B, 64), dtype=torch.float32, device=self.device)
+
         for _ in range(self.mcts_num_simulations):
             legal = (board == 0.0).view(B, -1)
+            # UCT公式
             uct = Q + self.c_puct * P * torch.sqrt(torch.clamp(N.sum(dim=1, keepdim=True), min=1.0)) / (1.0 + N)
             neg_inf = torch.finfo(uct.dtype).min
             uct = torch.where(legal, uct, torch.full_like(uct, neg_inf))
             a = torch.argmax(uct, dim=1)
-            # force win
+
+            # 强制选择制胜动作
             my = (board == side_vec.view(-1, 1, 1)).float()
             empty = (board == 0.0).float()
             win_mask = self._winning_mask(my, empty).view(B, -1)
             has_win = win_mask.any(1)
             win_actions = torch.argmax(win_mask.float(), dim=1)
             a = torch.where(has_win, win_actions, a)
-            x = a // 8; y = a % 8
+
+            x = a // 8
+            y = a % 8
             idx = torch.arange(B, device=self.device)
             new_bd = board.clone()
             new_bd[idx, x, y] = side_vec[idx]
+
+            # 检查是否终局
             w = self._judge_batched(new_bd)
             term = (w != 0)
+
+            # 计算价值
             v = torch.zeros(B, dtype=torch.float32, device=self.device)
             v = torch.where(term & (w == side_vec), torch.ones_like(v), v)
             v = torch.where(term & (w == -side_vec), -torch.ones_like(v), v)
-            need_rollout = ~term
-            if need_rollout.any():
-                v_roll = self._rollout_batched(new_bd[need_rollout], side_vec[need_rollout], self.rollout_max_moves)
-                v_tmp = v.clone()
-                v_tmp[need_rollout] = v_roll
-                v = v_tmp
-            # back to root stats
+
+            # 非终局：使用价值网络评估（替代rollout）
+            need_eval = ~term
+            if need_eval.any():
+                # 从对手视角评估，需要取反
+                with torch.no_grad():
+                    feats = self.extract_feature(new_bd[need_eval], -side_vec[need_eval])
+                    _, leaf_value = self.net(feats)
+                    # 价值是从对手视角的，所以取反
+                    v[need_eval] = -leaf_value.squeeze(-1)
+
+            # 更新统计
             N[idx, a] = N[idx, a] + 1.0
             W[idx, a] = W[idx, a] + v
             Q[idx, a] = W[idx, a] / N[idx, a]
+
         return N
 
     def _connectivity_channels(self, mask, Ns):
@@ -593,7 +766,11 @@ class Agent(nn.Module):
         return (counts >= 2).float()
 
     def mcts_search(self, batch_tracker, side, idx, prior_pi):
-        # 策略先验的MCTS：UCT选择、叶子随机rollout评估、回传更新N/W/Q
+        """
+        非批处理版本的MCTS（当前未使用，保留向后兼容）
+        注意：此方法尚未更新为使用价值网络，建议使用mcts_search_batched
+        策略先验的MCTS：UCT选择、叶子随机rollout评估、回传更新N/W/Q
+        """
         board = batch_tracker.board[idx].clone().to(self.device)
         turn = int(batch_tracker.player_to_go[idx].item())
         done = bool(batch_tracker.done[idx].item())
