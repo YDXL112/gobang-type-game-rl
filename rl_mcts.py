@@ -125,8 +125,8 @@ class Trainer:
 
             if self.use_a2c:
                 # A2C训练模式
-                losses = self._train_episode_a2c(half_self_play)
-                policy_loss, value_loss, entropy_loss, total_loss = losses
+                result = self._train_episode_a2c(half_self_play)
+                policy_loss, value_loss, entropy_loss, total_loss, ep_moves = result
                 off_rate = float((self.env.winners == 1).sum().item()) / float(self.batch_size)
                 draw_rate = float((self.env.winners == 0).sum().item()) / float(self.batch_size)
                 def_rate = float((self.env.winners == -1).sum().item()) / float(self.batch_size)
@@ -147,11 +147,20 @@ class Trainer:
                 print(f"[episode={ep}] steps={steps} loss={float(loss.item()):.6f}")
 
             # 记录episode信息
-            episodes_out.append({
-                "episode": ep,
-                "winner": int(self.env.winners[0].item()),
-                "steps": int(self.env.step_count[0].item()),
-            })
+            if self.use_a2c:
+                episodes_out.append({
+                    "episode": ep,
+                    "winner": int(self.env.winners[0].item()),
+                    "steps": len(ep_moves),
+                    "moves": ep_moves,
+                })
+            else:
+                # 原始模式需要从_train_episode_original获取moves（暂不实现，保持向后兼容）
+                episodes_out.append({
+                    "episode": ep,
+                    "winner": int(self.env.winners[0].item()),
+                    "steps": int(self.env.step_count[0].item()),
+                })
 
             # 周期评测与替换
             if self.eval_interval_episodes > 0 and ep % self.eval_interval_episodes == 0:
@@ -181,6 +190,9 @@ class Trainer:
         """
         A2C训练一个episode
         核心思想：使用价值网络作为Critic，计算TD-error作为advantage
+        Returns:
+            (policy_loss, value_loss, entropy_loss, total_loss, moves_list)
+            moves_list: 第一个batch的游戏记录，用于visualizer
         """
         # 存储轨迹数据
         log_probs_list = []  # 每步的log概率
@@ -189,6 +201,7 @@ class Trainer:
         sides_list = []      # 每步的玩家（1或-1）
         rewards_list = []    # 每步的即时奖励
         dones_list = []      # 每步是否结束
+        moves_list = []      # 记录第一个batch的游戏步骤（用于visualizer）
 
         steps = 0
         while True:
@@ -204,6 +217,17 @@ class Trainer:
             values_list.append(value)
             entropies_list.append(entropy)
             sides_list.append(side.float())
+
+            # 记录第一个batch的游戏步骤（用于visualizer）
+            if not bool(self.env.done[0].item()):
+                s0 = int(side[0].item())
+                a0 = int(actions[0].item())
+                moves_list.append({
+                    "step": steps,
+                    "side": s0,
+                    "x": a0 // 8,
+                    "y": a0 % 8,
+                })
 
             # 执行动作
             next_state, done, info = self.env.step(actions)
@@ -281,7 +305,8 @@ class Trainer:
             float(policy_loss.item()),
             float(value_loss.item()),
             float(entropy_loss.item()),
-            float(total_loss.item())
+            float(total_loss.item()),
+            moves_list  # 返回游戏记录
         )
 
     def _train_episode_original(self, half_self_play: bool):
