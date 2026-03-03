@@ -110,7 +110,7 @@ class Trainer:
             with open(csv_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 if self.use_a2c:
-                    writer.writerow(["episode", "off_win_rate", "draw_rate", "def_win_rate", "policy_loss", "value_loss", "entropy_loss", "total_loss"])
+                    writer.writerow(["episode", "off_win_rate", "draw_rate", "def_win_rate", "p1_loss", "p2_loss", "total_loss"])
                 else:
                     writer.writerow(["episode", "off_win_rate", "draw_rate", "def_win_rate", "loss"])
         if not os.path.exists(eval_log_path):
@@ -126,14 +126,14 @@ class Trainer:
             if self.use_a2c:
                 # A2C训练模式
                 result = self._train_episode_a2c(half_self_play)
-                policy_loss, value_loss, entropy_loss, total_loss, ep_moves = result
+                loss_p1, loss_p2, entropy_loss, total_loss, ep_moves = result
                 off_rate = float((self.env.winners == 1).sum().item()) / float(self.batch_size)
                 draw_rate = float((self.env.winners == 0).sum().item()) / float(self.batch_size)
                 def_rate = float((self.env.winners == -1).sum().item()) / float(self.batch_size)
                 with open(csv_path, "a", newline="", encoding="utf-8") as f:
                     writer = csv.writer(f)
-                    writer.writerow([ep, off_rate, draw_rate, def_rate, policy_loss, value_loss, entropy_loss, total_loss])
-                print(f"[episode={ep}] policy_loss={policy_loss:.4f} value_loss={value_loss:.4f} entropy_loss={entropy_loss:.4f} total_loss={total_loss:.4f}")
+                    writer.writerow([ep, off_rate, draw_rate, def_rate, loss_p1, loss_p2, total_loss])
+                print(f"[episode={ep}] p1_loss={loss_p1:.4f} p2_loss={loss_p2:.4f} total_loss={total_loss:.4f}")
             else:
                 # 原始训练模式（保留向后兼容）
                 loss, steps = self._train_episode_original(half_self_play)
@@ -188,37 +188,40 @@ class Trainer:
 
     def _train_episode_a2c(self, half_self_play: bool):
         """
-        A2C训练一个episode
-        核心思想：使用价值网络作为Critic，计算TD-error作为advantage
-        Returns:
-            (policy_loss, value_loss, entropy_loss, total_loss, moves_list)
-            moves_list: 第一个batch的游戏记录，用于visualizer
+        A2C训练一个episode，带奖励塑形
+        修改：只更新胜者的动作，避免梯度信号抵消
         """
-        # 存储轨迹数据
-        log_probs_list = []  # 每步的log概率
-        values_list = []     # 每步的价值估计
-        entropies_list = []  # 每步的熵
-        sides_list = []      # 每步的玩家（1或-1）
-        rewards_list = []    # 每步的即时奖励
-        dones_list = []      # 每步是否结束
-        moves_list = []      # 记录第一个batch的游戏步骤（用于visualizer）
+        # 分别存储双方的数据
+        log_probs_p1 = []  # 先手
+        log_probs_p2 = []  # 后手
+        values_p1 = []
+        values_p2 = []
+        entropies_p1 = []
+        entropies_p2 = []
+        rewards_p1 = []
+        rewards_p2 = []
+        dones_p1 = []
+        dones_p2 = []
+        moves_list = []
 
         steps = 0
         while True:
             state = self.env.state()
             side = self.env.turn().to(torch.int32)
 
-            # 获取动作、策略、熵、价值
             actions, probs, entropy, value = self.agent(state, side, self.env)
             log_prob = torch.log(probs + 1e-9)
 
-            # 存储当前步的数据
-            log_probs_list.append(log_prob)
-            values_list.append(value)
-            entropies_list.append(entropy)
-            sides_list.append(side.float())
+            # 分开存储双方数据
+            is_p1 = (side == 1)  # [B] bool
+            is_p2 = (side == -1)
 
-            # 记录第一个batch的游戏步骤（用于visualizer）
+            prev_state = state.clone()
+            prev_side = side.clone()
+
+            next_state, done, info = self.env.step(actions)
+
+            # 记录第一个batch的游戏步骤
             if not bool(self.env.done[0].item()):
                 s0 = int(side[0].item())
                 a0 = int(actions[0].item())
@@ -229,85 +232,192 @@ class Trainer:
                     "y": a0 % 8,
                 })
 
-            # 执行动作
-            next_state, done, info = self.env.step(actions)
-
-            # 计算即时奖励（游戏结束时才有非零奖励）
+            # 计算奖励
             winners = self.env.winners.to(self.device).float()
-            # 从当前玩家视角的奖励
             reward = torch.zeros(self.batch_size, device=self.device)
+
             for i in range(self.batch_size):
                 if done[i]:
-                    # 当前玩家赢了 = +1, 输了 = -1, 平局 = 0
-                    reward[i] = side[i].float() * winners[i]
-            rewards_list.append(reward)
-            dones_list.append(done.float())
+                    reward[i] = prev_side[i].float() * winners[i] * 10.0
+                else:
+                    reward[i] = self._compute_shaped_reward(
+                        prev_state[i], next_state[i], prev_side[i].item()
+                    )
+
+            # 分别存储
+            log_probs_p1.append(log_prob.clone())
+            log_probs_p2.append(log_prob.clone())
+            values_p1.append(value.clone())
+            values_p2.append(value.clone())
+            entropies_p1.append(entropy.clone())
+            entropies_p2.append(entropy.clone())
+
+            # 先手视角的奖励
+            r_p1 = torch.where(is_p1, reward, torch.zeros_like(reward))
+            # 后手视角的奖励（需要取反，因为winners=1表示先手赢）
+            r_p2 = torch.where(is_p2, reward, torch.zeros_like(reward))
+            rewards_p1.append(r_p1)
+            rewards_p2.append(r_p2)
+
+            # done标志
+            d_p1 = torch.where(is_p1, done.float(), torch.zeros_like(done.float()))
+            d_p2 = torch.where(is_p2, done.float(), torch.zeros_like(done.float()))
+            dones_p1.append(d_p1)
+            dones_p2.append(d_p2)
 
             steps += 1
             if self.env.all_done() or steps >= self.env.max_steps:
                 break
 
-        # 计算returns和advantages
-        T = len(log_probs_list)
+        # 分别计算双方的returns和loss
+        winners = self.env.winners.to(self.device)
 
-        # 获取最后状态的价值估计（用于bootstrapping）
-        if not self.env.all_done():
-            with torch.no_grad():
-                final_state = self.env.state()
-                final_side = self.env.turn().to(torch.int32)
-                _, _, _, final_value = self.agent(final_state, final_side, self.env)
-        else:
-            final_value = torch.zeros(self.batch_size, device=self.device)
+        # 先手方的loss（只有先手赢的batch参与）
+        loss_p1 = self._compute_loss_for_side(
+            log_probs_p1, values_p1, entropies_p1, rewards_p1, dones_p1,
+            mask=(winners == 1)  # 只有先手赢的参与
+        )
 
-        # 计算returns（从后向前）
-        returns = []
-        R = final_value
-        for t in reversed(range(T)):
-            # R = r_t + gamma * R * (1 - done_t)
-            R = rewards_list[t] + self.gamma * R * (1 - dones_list[t])
-            returns.insert(0, R)
+        # 后手方的loss（只有后手赢的batch参与）
+        loss_p2 = self._compute_loss_for_side(
+            log_probs_p2, values_p2, entropies_p2, rewards_p2, dones_p2,
+            mask=(winners == -1)  # 只有后手赢的参与
+        )
 
-        # 堆叠所有数据
-        log_probs = torch.stack(log_probs_list, dim=0)  # [T, B]
-        values = torch.stack(values_list, dim=0)        # [T, B]
-        entropies = torch.stack(entropies_list, dim=0)  # [T, B]
-        sides = torch.stack(sides_list, dim=0)          # [T, B]
-        returns = torch.stack(returns, dim=0)           # [T, B]
+        # 总loss = 先手loss + 后手loss
+        total_loss = loss_p1 + loss_p2
 
-        # 计算advantages（TD-error）
-        # advantage = return - value（价值网络作为baseline）
-        advantages = returns - values.detach()
-
-        # 计算损失
-        # 策略损失：-advantage * log_prob
-        policy_loss = -(advantages * log_probs).mean()
-
-        # 价值损失：MSE
-        value_loss = F.mse_loss(values, returns)
-
-        # 熵奖励（鼓励探索）
-        entropy_loss = -entropies.mean()
-
-        # 总损失
-        total_loss = policy_loss + self.value_loss_coef * value_loss + self.entropy_coef * entropy_loss
-
-        # 反向传播
         self.optim.zero_grad()
         total_loss.backward()
 
-        # 梯度裁剪
         if self.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(self.agent.parameters(), self.max_grad_norm)
 
         self.optim.step()
 
         return (
-            float(policy_loss.item()),
-            float(value_loss.item()),
-            float(entropy_loss.item()),
+            float(loss_p1.item()),
+            float(loss_p2.item()),
+            0.0,  # entropy单独算太复杂了，暂时返回0
             float(total_loss.item()),
-            moves_list  # 返回游戏记录
+            moves_list
         )
+
+    def _compute_loss_for_side(self, log_probs, values, entropies, rewards, dones, mask):
+        """计算某一方的loss，只更新mask=True的样本"""
+        T = len(log_probs)
+
+        # 计算returns
+        returns = []
+        R = torch.zeros(self.batch_size, device=self.device)
+        for t in reversed(range(T)):
+            R = rewards[t] + self.gamma * R * (1 - dones[t])
+            returns.insert(0, R)
+
+        log_probs_t = torch.stack(log_probs, dim=0)  # [T, B]
+        values_t = torch.stack(values, dim=0)
+        entropies_t = torch.stack(entropies, dim=0)
+        returns_t = torch.stack(returns, dim=0)
+
+        advantages = returns_t - values_t.detach()
+
+        # 只计算mask=True的样本的loss
+        mask_expanded = mask.float().view(1, -1).expand_as(log_probs_t)  # [T, B]
+
+        # policy loss
+        policy_loss = (advantages * log_probs_t * mask_expanded).sum() / (mask_expanded.sum() + 1e-8)
+
+        # value loss
+        value_loss = ((values_t - returns_t) ** 2 * mask_expanded).sum() / (mask_expanded.sum() + 1e-8)
+
+        # entropy loss
+        entropy_loss = (entropies_t * mask_expanded).sum() / (mask_expanded.sum() + 1e-8)
+
+        return -policy_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_loss
+
+    def _compute_shaped_reward(self, prev_state, next_state, side):
+        """
+        计算塑形奖励：鼓励好的棋型
+        """
+        device = self.device
+        side_f = float(side)
+
+        prev_board = prev_state
+        next_board = next_state
+
+        my_prev = (prev_board == side_f).float()
+        my_next = (next_board == side_f).float()
+        op_prev = (prev_board == -side_f).float()
+        op_next = (next_board == -side_f).float()
+
+        reward = 0.0
+
+        # 1. 形成活三：+0.3
+        live3_prev = self._count_live3(my_prev, op_prev)
+        live3_next = self._count_live3(my_next, op_next)
+        reward += (live3_next - live3_prev) * 0.3
+
+        # 2. 阻挡对手活三：+0.2
+        op_live3_prev = self._count_live3(op_prev, my_prev)
+        op_live3_next = self._count_live3(op_next, my_next)
+        # 对手活三减少，说明阻挡成功
+        reward += (op_live3_prev - op_live3_next) * 0.2
+
+        # 3. 形成活二：+0.05
+        live2_prev = self._count_live2(my_prev, op_prev)
+        live2_next = self._count_live2(my_next, op_next)
+        reward += (live2_next - live2_prev) * 0.05
+
+        # 4. 占据中心：+0.02
+        center = torch.zeros(8, 8, device=device)
+        center[3:5, 3:5] = 1.0
+        my_center_prev = (my_prev * center).sum()
+        my_center_next = (my_next * center).sum()
+        reward += (my_center_next - my_center_prev) * 0.02
+
+        return reward
+
+    def _count_live3(self, me, op):
+        """统计活三数量（三连且两端空）"""
+        empty = ((me == 0) & (op == 0)).float()
+        x_me = me.unsqueeze(0).unsqueeze(0)
+
+        count = 0
+        # 水平方向
+        k = torch.ones((1, 1, 1, 3), device=self.device)
+        sum3 = F.conv2d(x_me, k).squeeze(0).squeeze(0)  # [6, 6]
+        hits = (sum3 == 3.0)
+
+        for i in range(hits.shape[0]):
+            for j in range(hits.shape[1]):
+                if hits[i, j]:
+                    # 检查两端是否为空（在原始8x8棋盘上）
+                    left_j = j - 1
+                    right_j = j + 3
+                    if left_j >= 0 and right_j < 8:
+                        if empty[i, left_j] > 0 and empty[i, right_j] > 0:
+                            count += 1
+        return count
+
+    def _count_live2(self, me, op):
+        """统计活二数量（二连且两端空）"""
+        empty = ((me == 0) & (op == 0)).float()
+        x_me = me.unsqueeze(0).unsqueeze(0)
+
+        count = 0
+        k = torch.ones((1, 1, 1, 2), device=self.device)
+        sum2 = F.conv2d(x_me, k).squeeze(0).squeeze(0)  # [7, 7]
+        hits = (sum2 == 2.0)
+
+        for i in range(hits.shape[0]):
+            for j in range(hits.shape[1]):
+                if hits[i, j]:
+                    left_j = j - 1
+                    right_j = j + 2
+                    if left_j >= 0 and right_j < 8:
+                        if empty[i, left_j] > 0 and empty[i, right_j] > 0:
+                            count += 1
+        return count
 
     def _train_episode_original(self, half_self_play: bool):
         """原始训练方法（向后兼容）"""

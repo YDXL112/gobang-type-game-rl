@@ -25,8 +25,8 @@ class Agent(nn.Module):
     ):
         super().__init__()
         self.device = torch.device(device) if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # 策略-价值网络（输入27通道特征：原19 + 新增8通道威胁特征）
-        self.net = PolicyValueNet(in_channels=27, stem_kernel_size=stem_kernel_size, block_kernel_size=block_kernel_size, channels=channels, num_layers=num_layers, activation=activation, bias=bias).to(self.device)
+        # 策略-价值网络（输入28通道特征）
+        self.net = PolicyValueNet(in_channels=28, stem_kernel_size=stem_kernel_size, block_kernel_size=block_kernel_size, channels=channels, num_layers=num_layers, activation=activation, bias=bias).to(self.device)
         self.mcts_num_simulations = int(mcts_num_simulations)
         self.mcts_max_depth = int(mcts_max_depth)
         self.c_puct = float(c_puct)
@@ -38,11 +38,6 @@ class Agent(nn.Module):
     def forward(self, state, side, batch_tracker):
         """
         前向推理：返回动作、策略概率、熵、以及价值估计
-        Returns:
-            actions: 选择的动作 [B]
-            probs: 动作对应的概率 [B]
-            entropy: 策略熵 [B]
-            value: 局面价值估计 [B]，范围[-1,1]
         """
         state = torch.tensor(state, dtype=torch.float32, device=self.device) if not isinstance(state, torch.Tensor) else state.to(self.device).float()
         if isinstance(side, torch.Tensor):
@@ -51,67 +46,109 @@ class Agent(nn.Module):
             side_vec = torch.full((state.shape[0],), float(int(side)), device=self.device)
         legal = batch_tracker.legal_mask().to(self.device)
         feats = self.extract_feature(state, side_vec)
-        logits, value = self.net(feats)  # 现在网络返回两个值
+        logits, value = self.net(feats)
         flat_logits = logits.flatten(1)
         mask = legal.view(legal.shape[0], -1)
         neg_inf = torch.finfo(flat_logits.dtype).min
         flat_logits = torch.where(mask, flat_logits, torch.full_like(flat_logits, neg_inf))
         pi = torch.softmax(flat_logits, dim=-1)
 
-        # 获取我的制胜位置和对手的制胜位置（需要阻挡）
+        # 获取棋盘状态
         b = state.clone()
         side_t = side_vec.view(-1, 1, 1)
         my = (b == side_t).float()
         op = (b == -side_t).float()
         empty = (b == 0.0).float()
+        B = state.shape[0]
 
-        # 我的制胜位置
+        # === 计算各种启发式分数 ===
+        heuristic_scores = torch.zeros(B, 64, device=self.device)
+
+        # 1. 一步制胜：最高优先级 (分数=100)
         my_win_mask = self._winning_mask(my, empty)
-        my_win_flat = my_win_mask.view(my_win_mask.shape[0], -1)
-        has_my_win = my_win_flat.any(dim=1)
+        my_win_flat = my_win_mask.view(B, -1).float()
+        heuristic_scores += my_win_flat * 100.0
 
-        # 对手的制胜位置（必须阻挡！）
+        # 2. 阻挡对手一步制胜：次高优先级 (分数=90)
         op_win_mask = self._winning_mask(op, empty)
-        op_win_flat = op_win_mask.view(op_win_mask.shape[0], -1)
-        has_op_win = op_win_flat.any(dim=1)
+        op_win_flat = op_win_mask.view(B, -1).float()
+        heuristic_scores += op_win_flat * 90.0
 
-        # 优先级：自己能赢 > 阻挡对手 > 正常选择
+        # 3. 形成活三：高优先级 (分数=50)
+        my_live3 = self._get_live3_positions(my, op, empty)
+        heuristic_scores += my_live3.view(B, -1) * 50.0
+
+        # 4. 阻挡对手活三：较高优先级 (分数=45)
+        op_live3 = self._get_live3_positions(op, my, empty)
+        heuristic_scores += op_live3.view(B, -1) * 45.0
+
+        # 5. 中心位置奖励 (分数=5-10)
+        center_bonus = self._get_center_bonus(empty)  # [B, 64]
+        heuristic_scores += center_bonus * 5.0
+
+        # 6. 形成活二：低优先级 (分数=10)
+        my_live2 = self._get_live2_positions(my, op, empty)
+        heuristic_scores += my_live2.view(B, -1) * 10.0
+
+        # 屏蔽非法位置
+        heuristic_scores = torch.where(mask, heuristic_scores, torch.full_like(heuristic_scores, -1e9))
+
+        # === 决定动作 ===
         if self.use_policy_sampling or self.mcts_num_simulations <= 0:
-            actions_sample = torch.multinomial(pi, 1).squeeze(1)
-            # 优先选择制胜动作
-            my_win_actions = torch.argmax(my_win_flat.float(), dim=1)
-            # 其次选择阻挡动作
-            op_win_actions = torch.argmax(op_win_flat.float(), dim=1)
-            # 优先级：自己赢 > 阻挡对手 > 正常采样
-            actions = torch.where(has_my_win, my_win_actions,
-                                  torch.where(has_op_win, op_win_actions, actions_sample))
-            probs = pi[torch.arange(state.shape[0], device=self.device), actions]
+            # 混合策略：以一定概率选择启发式最佳，否则按网络策略采样
+            # 这保证了探索的同时，也有足够强的baseline
+            heuristic_actions = torch.argmax(heuristic_scores, dim=1)
+            sample_actions = torch.multinomial(pi, 1).squeeze(1)
+
+            # 如果有高分位置（>40分），90%概率选它；否则按网络采样
+            max_scores = heuristic_scores.max(dim=1).values
+            use_heuristic = (max_scores > 40.0) & (torch.rand(B, device=self.device) < 0.95)
+            actions = torch.where(use_heuristic, heuristic_actions, sample_actions)
         else:
             counts = self.mcts_search_batched(batch_tracker, side_vec, pi, value)
-            actions_counts = torch.argmax(counts, dim=1)
-            my_win_actions = torch.argmax(my_win_flat.float(), dim=1)
-            op_win_actions = torch.argmax(op_win_flat.float(), dim=1)
-            actions = torch.where(has_my_win, my_win_actions,
-                                  torch.where(has_op_win, op_win_actions, actions_counts))
-            probs = pi[torch.arange(state.shape[0], device=self.device), actions]
+            actions = torch.argmax(counts, dim=1)
 
+        probs = pi[torch.arange(B, device=self.device), actions]
         entropy = -(pi * torch.log(pi + 1e-9)).sum(dim=1)
-        value = value.squeeze(-1)  # [B, 1] -> [B]
+        value = value.squeeze(-1)
         return actions, probs, entropy, value
+
+    def _get_live3_positions(self, me, op, empty):
+        """获取能形成活三的位置"""
+        # 复用_live_rush的结果
+        _, live3, _ = self._live_rush(me, op)
+        return live3
+
+    def _get_live2_positions(self, me, op, empty):
+        """获取能形成活二的位置"""
+        live2, _, _ = self._live_rush(me, op)
+        return live2
+
+    def _get_center_bonus(self, empty):
+        """中心位置奖励"""
+        B = empty.shape[0]
+        device = empty.device
+        # 中心4x4区域有额外奖励
+        center_mask = torch.zeros(8, 8, device=device)
+        center_mask[2:6, 2:6] = 1.0
+        # 最中心的2x2奖励更高
+        center_mask[3:5, 3:5] = 2.0
+        return (empty * center_mask.unsqueeze(0)).view(B, -1)
 
     def extract_feature(self, state, side):
         """
-        构造27通道特征：
+        构造28通道特征：
         原有19通道：
           - 我/对掩码 (2)
           - 连通度(1/2/3)*2 (6)
           - 活2/活3/冲3/双二/双三*2 (10)
           - legal_mask (1)
-        新增8通道威胁特征：
+        新增9通道：
+          - 当前玩家标识 (1)  <-- 新增！全1或全-1
           - 我的制胜位置 (1)
-          - 对手制胜位置/必须阻挡 (1)
-          - 我的活三威胁位置 (1)
-          - 对手活三威胁位置 (1)
+          - 对手制胜位置 (1)
+          - 我的活三威胁 (1)
+          - 对手活三威胁 (1)
           - 我的冲四位置 (1)
           - 对手冲四位置 (1)
           - 我的双三位置 (1)
@@ -143,38 +180,33 @@ class Agent(nn.Module):
         feats.append(self._double_three(op, my)) # 17
         feats.append(empty)  # 18: 空位
 
-        # === 新增威胁特征 (8通道) ===
-        # 19: 我的制胜位置（一步能赢）
+        # === 新增特征 (9通道) ===
+        # 19: 当前玩家标识（先手=全1，后手=全-1）
+        side_channel = torch.full_like(my, fill_value=0.0)
+        side_channel[:] = side.view(-1, 1, 1)
+        feats.append(side_channel)
+
+        # 20: 我的制胜位置（一步能赢）
         my_win = self._winning_mask(my, empty).float()
         feats.append(my_win)
 
-        # 20: 对手制胜位置（必须阻挡！）
+        # 21: 对手制胜位置（必须阻挡！）
         op_win = self._winning_mask(op, empty).float()
         feats.append(op_win)
 
-        # 21: 我的活三威胁位置（下一步能形成活三的位置）
+        # 22: 我的活三威胁位置
         my_live3_threat = self._threat_positions(my, op, empty, n=3)
         feats.append(my_live3_threat)
 
-        # 22: 对手活三威胁位置（需要预先阻挡）
+        # 23: 对手活三威胁位置
         op_live3_threat = self._threat_positions(op, my, empty, n=3)
         feats.append(op_live3_threat)
 
-        # 23: 我的冲四位置（已有三子且一端被堵，但另一端空）
-        my_rush4 = self._rush_four_positions(my, op, empty)
-        feats.append(my_rush4)
-
-        # 24: 对手冲四位置
-        op_rush4 = self._rush_four_positions(op, my, empty)
-        feats.append(op_rush4)
-
-        # 25: 我的双三威胁位置
-        my_double3 = self._double_three(my, op)
-        feats.append(my_double3)
-
-        # 26: 对手双三威胁位置
-        op_double3 = self._double_three(op, my)
-        feats.append(op_double3)
+        # 24-27: 冲四和双三位置
+        feats.append(self._rush_four_positions(my, op, empty))
+        feats.append(self._rush_four_positions(op, my, empty))
+        feats.append(self._double_three(my, op))
+        feats.append(self._double_three(op, my))
 
         x = torch.stack(feats, dim=1)
         return x
