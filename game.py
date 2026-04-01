@@ -106,8 +106,8 @@ class Board(object):
         states = self.states
         n = self.n_in_row
 
-        moved = list(set(range(width * height)) - set(self.availables))
-        if len(moved) < n * 2 - 1:
+        moved = list(self.states.keys())
+        if len(moved) < self.n_in_row * 2 - 1:
             return False, -1
 
         for m in moved:
