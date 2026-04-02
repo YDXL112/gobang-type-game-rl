@@ -35,7 +35,6 @@
 
 **图形化人机对战（推荐）：**
 ```bash
-conda activate pytorch311
 python play_gui.py
 ```
 
