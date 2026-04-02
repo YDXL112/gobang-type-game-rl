@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-A pure implementation of the Monte Carlo Tree Search (MCTS)
-
-@author: Junxiao Song
+纯蒙特卡洛树搜索（不使用神经网络）。
+通过随机模拟评估叶节点，用于训练时的基准对手。
 """
 
 import numpy as np
@@ -11,82 +10,75 @@ from operator import itemgetter
 
 
 def rollout_policy_fn(board):
-    """a coarse, fast version of policy_fn used in the rollout phase."""
-    # rollout randomly
+    """随机策略，用于模拟阶段的快速落子。"""
     action_probs = np.random.rand(len(board.availables))
     return zip(board.availables, action_probs)
 
 
 def policy_value_fn(board):
-    """a function that takes in a state and outputs a list of (action, probability)
-    tuples and a score for the state"""
-    # return uniform probabilities and 0 score for pure MCTS
+    """均匀概率策略，返回等概率和零评分（纯 MCTS 不使用网络）。"""
     action_probs = np.ones(len(board.availables))/len(board.availables)
     return zip(board.availables, action_probs), 0
 
 
 class TreeNode(object):
-    """A node in the MCTS tree. Each node keeps track of its own value Q,
-    prior probability P, and its visit-count-adjusted prior score u.
+    """
+    MCTS 树节点。
+    每个节点维护自身的价值 Q、先验概率 P 和基于访问次数调整的先验得分 u。
     """
 
     def __init__(self, parent, prior_p):
         self._parent = parent
-        self._children = {}  # a map from action to TreeNode
+        self._children = {}  # 动作 -> 子节点 的映射
         self._n_visits = 0
         self._Q = 0
         self._u = 0
         self._P = prior_p
 
     def expand(self, action_priors):
-        """Expand tree by creating new children.
-        action_priors: a list of tuples of actions and their prior probability
-            according to the policy function.
+        """
+        根据策略函数输出的动作先验概率扩展子节点。
+        action_priors: (动作, 先验概率) 元组列表
         """
         for action, prob in action_priors:
             if action not in self._children:
                 self._children[action] = TreeNode(self, prob)
 
     def select(self, c_puct):
-        """Select action among children that gives maximum action value Q
-        plus bonus u(P).
-        Return: A tuple of (action, next_node)
+        """
+        选择使 Q + u(P) 最大的子节点。
+        返回: (动作, 子节点)
         """
         return max(self._children.items(),
                    key=lambda act_node: act_node[1].get_value(c_puct))
 
     def update(self, leaf_value):
-        """Update node values from leaf evaluation.
-        leaf_value: the value of subtree evaluation from the current player's
-            perspective.
         """
-        # Count visit.
+        根据叶节点评估值更新当前节点。
+        leaf_value: 从当前玩家视角的子树评估值
+        """
         self._n_visits += 1
-        # Update Q, a running average of values for all visits.
+        # Q 为所有访问值的滑动平均
         self._Q += 1.0*(leaf_value - self._Q) / self._n_visits
 
     def update_recursive(self, leaf_value):
-        """Like a call to update(), but applied recursively for all ancestors.
-        """
-        # If it is not root, this node's parent should be updated first.
+        """递归地更新当前节点及其所有祖先。"""
         if self._parent:
             self._parent.update_recursive(-leaf_value)
         self.update(leaf_value)
 
     def get_value(self, c_puct):
-        """Calculate and return the value for this node.
-        It is a combination of leaf evaluations Q, and this node's prior
-        adjusted for its visit count, u.
-        c_puct: a number in (0, inf) controlling the relative impact of
-            value Q, and prior probability P, on this node's score.
+        """
+        计算并返回当前节点的选择得分。
+        得分 = 叶节点评估 Q + 基于访问次数调整的先验 u
+        c_puct: 控制 Q 值与先验概率 P 相对影响的参数
         """
         self._u = (c_puct * self._P *
                    np.sqrt(self._parent._n_visits) / (1 + self._n_visits))
         return self._Q + self._u
 
     def is_leaf(self):
-        """Check if leaf node (i.e. no nodes below this have been expanded).
-        """
+        """判断是否为叶节点（未扩展子节点）。"""
         return self._children == {}
 
     def is_root(self):
@@ -94,17 +86,14 @@ class TreeNode(object):
 
 
 class MCTS(object):
-    """A simple implementation of Monte Carlo Tree Search."""
+    """纯蒙特卡洛树搜索实现（不使用神经网络）。"""
 
     def __init__(self, policy_value_fn, c_puct=5, n_playout=10000):
         """
-        policy_value_fn: a function that takes in a board state and outputs
-            a list of (action, probability) tuples and also a score in [-1, 1]
-            (i.e. the expected value of the end game score from the current
-            player's perspective) for the current player.
-        c_puct: a number in (0, inf) that controls how quickly exploration
-            converges to the maximum-value policy. A higher value means
-            relying on the prior more.
+        policy_value_fn: 接收棋盘状态，返回 (动作, 概率) 元组列表和
+            当前局面评分的函数
+        c_puct: 控制探索与利用权衡的参数
+        n_playout: 每次决策的模拟次数
         """
         self._root = TreeNode(None, 1.0)
         self._policy = policy_value_fn
@@ -112,33 +101,33 @@ class MCTS(object):
         self._n_playout = n_playout
 
     def _playout(self, state):
-        """Run a single playout from the root to the leaf, getting a value at
-        the leaf and propagating it back through its parents.
-        State is modified in-place, so a copy must be provided.
+        """
+        从根节点到叶节点执行一次模拟，获取叶节点评估值并回传更新。
+        注意: state 会被原地修改，调用前需传入副本。
         """
         node = self._root
         while(1):
             if node.is_leaf():
 
                 break
-            # Greedily select next move.
+            # 贪心地选择下一步
             action, node = node.select(self._c_puct)
             state.do_move(action)
 
         action_probs, _ = self._policy(state)
-        # Check for end of game
+        # 检查游戏是否结束
         end, winner = state.game_end()
         if not end:
             node.expand(action_probs)
-        # Evaluate the leaf node by random rollout
+        # 通过随机模拟评估叶节点
         leaf_value = self._evaluate_rollout(state)
-        # Update value and visit count of nodes in this traversal.
+        # 回传更新路径上所有节点的访问次数和价值
         node.update_recursive(-leaf_value)
 
     def _evaluate_rollout(self, state, limit=1000):
-        """Use the rollout policy to play until the end of the game,
-        returning +1 if the current player wins, -1 if the opponent wins,
-        and 0 if it is a tie.
+        """
+        使用随机策略模拟至游戏结束。
+        返回: +1 当前玩家胜, -1 对手胜, 0 平局
         """
         player = state.get_current_player()
         for i in range(limit):
@@ -149,18 +138,17 @@ class MCTS(object):
             max_action = max(action_probs, key=itemgetter(1))[0]
             state.do_move(max_action)
         else:
-            # If no break from the loop, issue a warning.
-            print("WARNING: rollout reached move limit")
-        if winner == -1:  # tie
+            print("WARNING: 模拟达到步数上限")
+        if winner == -1:  # 平局
             return 0
         else:
             return 1 if winner == player else -1
 
     def get_move(self, state):
-        """Runs all playouts sequentially and returns the most visited action.
-        state: the current game state
-
-        Return: the selected action
+        """
+        执行所有模拟并返回访问次数最多的动作。
+        state: 当前游戏状态
+        返回: 选中的动作
         """
         for n in range(self._n_playout):
             state_copy = copy.deepcopy(state)
@@ -169,8 +157,8 @@ class MCTS(object):
                    key=lambda act_node: act_node[1]._n_visits)[0]
 
     def update_with_move(self, last_move):
-        """Step forward in the tree, keeping everything we already know
-        about the subtree.
+        """
+        在树中前进到 last_move 对应的子节点，保留已知子树信息。
         """
         if last_move in self._root._children:
             self._root = self._root._children[last_move]
@@ -183,7 +171,8 @@ class MCTS(object):
 
 
 class MCTSPlayer(object):
-    """AI player based on MCTS"""
+    """基于纯 MCTS 的 AI 玩家（不使用神经网络）。"""
+
     def __init__(self, c_puct=5, n_playout=2000):
         self.mcts = MCTS(policy_value_fn, c_puct, n_playout)
 
@@ -200,7 +189,7 @@ class MCTSPlayer(object):
             self.mcts.update_with_move(-1)
             return move
         else:
-            print("WARNING: the board is full")
+            print("WARNING: 棋盘已满")
 
     def __str__(self):
         return "MCTS {}".format(self.player)

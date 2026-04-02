@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Board and Game logic for Connect Four (free placement variant).
-Adapted from AlphaZero_Gomoku/game.py by Junxiao Song.
+四子棋棋盘与游戏逻辑（自由放置变体）。
 
-Rules:
-- Free placement: pieces can be placed on any empty cell
-- Restricted positions: edges/corners can be excluded
-- Win condition: first to connect n_in_row pieces in a line (horizontal/vertical/diagonal)
+规则：
+- 自由放置：棋子可以放在任意空位上（无重力下落）
+- 禁区：棋盘四角的八角形区域不可落子
+- 胜负：先在横/竖/斜方向连成 n_in_row 子的一方获胜
 """
 
 from __future__ import print_function
@@ -14,13 +13,13 @@ import numpy as np
 
 
 class Board(object):
-    """Board for the Connect Four game."""
+    """四子棋棋盘。"""
 
     def __init__(self, **kwargs):
         self.width = int(kwargs.get('width', 8))
         self.height = int(kwargs.get('height', 8))
         self.n_in_row = int(kwargs.get('n_in_row', 4))
-        # restricted positions: set of (row, col) tuples that cannot be used
+        # 禁区位置集合：元组 (row, col)
         self.restricted_positions = set()
         restricted = kwargs.get('restricted_positions', [])
         for pos in restricted:
@@ -31,10 +30,9 @@ class Board(object):
 
     def init_board(self, start_player=0):
         if self.width < self.n_in_row or self.height < self.n_in_row:
-            raise Exception('board width and height can not be '
-                            'less than {}'.format(self.n_in_row))
+            raise Exception('棋盘宽高不能小于 {}'.format(self.n_in_row))
         self.current_player = self.players[start_player]
-        # all positions minus restricted ones
+        # 所有合法位置（排除禁区）
         self.availables = []
         for i in range(self.width * self.height):
             h, w = self.move_to_location(i)
@@ -45,8 +43,8 @@ class Board(object):
 
     def move_to_location(self, move):
         """
-        Map 1D index to 2D (row, col).
-        Board layout (width=3, height=3):
+        一维索引 -> 二维坐标 (row, col)。
+        棋盘布局示例 (width=3, height=3):
         6 7 8
         3 4 5
         0 1 2
@@ -66,12 +64,13 @@ class Board(object):
         return move
 
     def current_state(self):
-        """Return the board state from the perspective of the current player.
-        State shape: 4 x width x height
-        Channel 0: current player's pieces
-        Channel 1: opponent's pieces
-        Channel 2: last move location
-        Channel 3: current player indicator (all 1 if first player)
+        """
+        返回当前玩家视角下的棋盘状态。
+        形状: 4 x width x height
+        通道 0: 当前玩家的棋子
+        通道 1: 对手的棋子
+        通道 2: 上一步落子位置
+        通道 3: 当前玩家标识（先手为全1）
         """
         square_state = np.zeros((4, self.width, self.height))
         if self.states:
@@ -82,7 +81,7 @@ class Board(object):
                             move_curr % self.height] = 1.0
             square_state[1][move_oppo // self.width,
                             move_oppo % self.height] = 1.0
-            # indicate the last move location
+            # 标记上一步落子位置
             if self.last_move != -1:
                 square_state[2][self.last_move // self.width,
                                 self.last_move % self.height] = 1.0
@@ -100,7 +99,7 @@ class Board(object):
         self.last_move = move
 
     def has_a_winner(self):
-        """Check if any player has connected n_in_row pieces."""
+        """检查是否有玩家连成 n_in_row 子。"""
         width = self.width
         height = self.height
         states = self.states
@@ -115,22 +114,22 @@ class Board(object):
             w = m % width
             player = states[m]
 
-            # horizontal
+            # 水平方向
             if (w in range(width - n + 1) and
                     len(set(states.get(i, -1) for i in range(m, m + n))) == 1):
                 return True, player
 
-            # vertical
+            # 垂直方向
             if (h in range(height - n + 1) and
                     len(set(states.get(i, -1) for i in range(m, m + n * width, width))) == 1):
                 return True, player
 
-            # diagonal (top-left to bottom-right)
+            # 主对角线（左上到右下）
             if (w in range(width - n + 1) and h in range(height - n + 1) and
                     len(set(states.get(i, -1) for i in range(m, m + n * (width + 1), width + 1))) == 1):
                 return True, player
 
-            # diagonal (top-right to bottom-left)
+            # 副对角线（右上到左下）
             if (w in range(n - 1, width) and h in range(height - n + 1) and
                     len(set(states.get(i, -1) for i in range(m, m + n * (width - 1), width - 1))) == 1):
                 return True, player
@@ -138,7 +137,7 @@ class Board(object):
         return False, -1
 
     def game_end(self):
-        """Check whether the game is ended or not."""
+        """检查游戏是否结束。"""
         win, winner = self.has_a_winner()
         if win:
             return True, winner
@@ -151,13 +150,13 @@ class Board(object):
 
 
 class Game(object):
-    """Game server."""
+    """游戏服务器，管理对局流程。"""
 
     def __init__(self, board, **kwargs):
         self.board = board
 
     def graphic(self, board, player1, player2):
-        """Draw the board and show game info."""
+        """以文本方式绘制棋盘。"""
         width = board.width
         height = board.height
 
@@ -183,10 +182,9 @@ class Game(object):
             print('\r\n\r\n')
 
     def start_play(self, player1, player2, start_player=0, is_shown=1):
-        """Start a game between two players."""
+        """开始一局双人对战。"""
         if start_player not in (0, 1):
-            raise Exception('start_player should be either 0 (player1 first) '
-                            'or 1 (player2 first)')
+            raise Exception('start_player 应为 0 (player1先手) 或 1 (player2先手)')
         self.board.init_board(start_player)
         p1, p2 = self.board.players
         player1.set_player_ind(p1)
@@ -211,8 +209,9 @@ class Game(object):
                 return winner
 
     def start_self_play(self, player, is_shown=0, temp=1e-3):
-        """Start a self-play game using a MCTS player, reuse the search tree,
-        and store the self-play data: (state, mcts_probs, z) for training.
+        """
+        使用 MCTS 玩家进行自我对弈，复用搜索树，
+        并保存自博弈数据 (state, mcts_probs, z) 用于训练。
         """
         self.board.init_board()
         p1, p2 = self.board.players
@@ -221,22 +220,22 @@ class Game(object):
             move, move_probs = player.get_action(self.board,
                                                  temp=temp,
                                                  return_prob=1)
-            # store the data
+            # 保存数据
             states.append(self.board.current_state())
             mcts_probs.append(move_probs)
             current_players.append(self.board.current_player)
-            # perform a move
+            # 执行落子
             self.board.do_move(move)
             if is_shown:
                 self.graphic(self.board, p1, p2)
             end, winner = self.board.game_end()
             if end:
-                # winner from the perspective of the current player of each state
+                # 从每个状态当前玩家的视角计算胜负标签
                 winners_z = np.zeros(len(current_players))
                 if winner != -1:
                     winners_z[np.array(current_players) == winner] = 1.0
                     winners_z[np.array(current_players) != winner] = -1.0
-                # reset MCTS root node
+                # 重置 MCTS 根节点
                 player.reset_player()
                 if is_shown:
                     if winner != -1:

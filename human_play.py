@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Human vs AI for Connect Four.
-Input your move in the format: row,col  (e.g. 3,4)
-
-Adapted from AlphaZero_Gomoku/human_play.py by Junxiao Song.
+命令行人机对战。
+输入格式: row,col  (例如 3,4)
 """
 
 from __future__ import print_function
@@ -14,7 +12,7 @@ from policy_value_net import PolicyValueNet
 
 
 class Human(object):
-    """Human player."""
+    """人类玩家。"""
 
     def __init__(self):
         self.player = None
@@ -25,13 +23,13 @@ class Human(object):
     def get_action(self, board):
         try:
             location = input("Your move (row,col): ")
-            if isinstance(location, str):  # for python3
+            if isinstance(location, str):  # python3
                 location = [int(n, 10) for n in location.split(",")]
             move = board.location_to_move(location)
         except Exception as e:
             move = -1
         if move == -1 or move not in board.availables:
-            print("invalid move")
+            print("无效落子")
             move = self.get_action(board)
         return move
 
@@ -60,20 +58,20 @@ def run():
                       restricted_positions=restricted_positions)
         game = Game(board)
 
-        # load the trained policy_value_net
+        # 加载训练好的策略-价值网络
         best_policy = PolicyValueNet(board_width, board_height,
                                      model_file=model_file)
         mcts_player = MCTSPlayer(best_policy.policy_value_fn,
                                  c_puct=5,
                                  n_playout=400)
 
-        # uncomment to play against pure MCTS (much weaker)
+        # 取消注释可与纯 MCTS 对战（弱得多）
         # mcts_player = MCTS_Pure(c_puct=5, n_playout=1000)
 
-        # human player, input your move in the format: row,col
+        # 人类玩家，输入格式: row,col
         human = Human()
 
-        # set start_player=0 for human first
+        # 设置 start_player=0 为人类先手
         game.start_play(human, mcts_player, start_player=0, is_shown=1)
     except KeyboardInterrupt:
         print('\n\rquit')
